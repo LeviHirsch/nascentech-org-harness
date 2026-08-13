@@ -40,3 +40,5 @@ authorized_keys
 
 # Log files — may capture prompt or payload contents
 *.log
+.dev/
+TASKS.md
