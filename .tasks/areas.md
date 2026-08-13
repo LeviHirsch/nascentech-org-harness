@@ -7,3 +7,4 @@
 - sessions: Org session packages on the mini; retrieval later
 - nodes: Directory work surfaces; address is the full path; agent and human share the node
 - retrieve: Filtered context and promotion detection; never a corpus dump
+- threads: Org thread/project/task assignment and Workspace surfacing
