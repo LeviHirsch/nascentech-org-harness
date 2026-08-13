@@ -1,0 +1,42 @@
+# OS cruft
+.DS_Store
+Icon?
+
+# Office binaries — keep the repo text-only
+*.xlsm
+*.xlsx
+*.xls
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Local env / secrets — never commit auth state or tokens
+# Match the literal filenames tools actually emit. Note the near-misses these replace:
+#   `.credentials.json` did NOT match `credentials.json`
+#   `*.token`           did NOT match `token.json`
+# Credentials belong in ~/.collevity/auth/ — see LAUNCH-ACCESS.md standing rules.
+.env
+*.env
+.env.*
+credentials.json
+*credentials*.json
+token.json
+*.token
+*client_secret*
+*.pem
+*.p12
+*service-account*
+
+# SSH material — this project handles per-person keys; never track one
+id_*
+*.pub
+authorized_keys
+
+# Log files — may capture prompt or payload contents
+*.log
