@@ -5,3 +5,4 @@
 - capture: Org append store, actor-stamped capture, thin harness action log
 - skills: Org skills read whoami; later skill-driven triggers
 - sessions: Org session packages on the mini; retrieval later
+- nodes: Directory work surfaces; address is the full path; agent and human share the node
