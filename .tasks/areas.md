@@ -9,3 +9,4 @@
 - retrieve: Filtered context and promotion detection; never a corpus dump
 - threads: Org thread/project/task assignment and Workspace surfacing
 - clv: clv + clv-dwd source in this repo; deploy to ~/.collevity/bin
+- entry: authorized_keys bind, Host aliases, per-device SSH setup
