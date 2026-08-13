@@ -10,3 +10,4 @@
 - entry: authorized_keys bind, Host aliases, per-device SSH setup
 - orchestrate: Org /orchestrate pass: judge and hand off, do not do the thread work
 - agents: How agents attach: CLI surface, one SDK wedge, actor vs model account vs DWD
+- dwd: signJwt impersonation client; subject switch; not MCP
