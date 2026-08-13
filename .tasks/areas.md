@@ -11,3 +11,4 @@
 - agents: How agents attach: CLI surface, one SDK wedge, actor vs model account vs DWD
 - dwd: signJwt impersonation client; subject switch; not MCP
 - workspace: Mail, calendar, tasks, Docs, Sheets as a person
+- mailman: Live session-to-session notes. Not orchestrate. Not close-time SPP.
