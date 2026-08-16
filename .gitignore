@@ -42,3 +42,4 @@ authorized_keys
 *.log
 .dev/
 TASKS.md
+board
