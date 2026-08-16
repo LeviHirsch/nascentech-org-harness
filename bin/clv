@@ -1,0 +1,118 @@
+#!/bin/sh
+# clv — the identity + scope seam for the Collevity org harness.
+#
+# THE RULE: nothing downstream reads identity any other way. Not $USER, not the
+# SSH key, not team/roster.json directly. Everything goes through `clv whoami`.
+# The substrate underneath WILL change (ssh-key -> cf-access-sso); consumers
+# must not notice.
+#
+# Deliberately minimal. Two subcommands. Resist adding more here — this is a
+# prep-stage seam, not the harness.
+
+set -eu
+
+CLV_HOME="${CLV_HOME:-$HOME/.collevity}"
+CLV_ENV_ROOT="${CLV_ENV_ROOT:-$HOME/nascentech-env}"
+CLV_ORG_ROOT="${CLV_ORG_ROOT:-$HOME/nascentech-env/google-nt-shared-drive}"
+
+# ---------------------------------------------------------------- identity ---
+# Resolution order. First hit wins. `method` records HOW identity was
+# established and is meant to be written onto every record alongside `principal`
+# — provenance you cannot enforce must be labelled as such, so downstream can
+# tell which rows to trust.
+#
+#   ssh-key       CLV_PRINCIPAL injected by clv-login from the authorized_keys
+#                 entry. Cryptographic: proves possession of a specific key.
+#   cf-access-sso reserved. Cloudflare Access short-lived cert principal.
+#                 Not implemented — this is the documented upgrade path.
+#   declared      ~/.collevity/user/principal. Self-asserted, no proof.
+#                 For local/non-SSH contexts. Trust accordingly.
+#   none          unknown. Callers MUST handle this rather than defaulting.
+
+resolve_identity() {
+	if [ -n "${CLV_PRINCIPAL:-}" ]; then
+		principal="$CLV_PRINCIPAL"
+		method="${CLV_PRINCIPAL_METHOD:-ssh-key}"
+	elif [ -r "$CLV_HOME/user/principal" ]; then
+		principal="$(head -n1 "$CLV_HOME/user/principal" | tr -d '[:space:]')"
+		method="declared"
+	else
+		principal=""
+		method="none"
+	fi
+
+	# subject = who we act on behalf of in Google (the DWD impersonation
+	# target). Distinct from principal on purpose; see BRIEF.md §4.
+	if [ -n "${CLV_SUBJECT:-}" ]; then
+		subject="$CLV_SUBJECT"
+	elif [ -n "$principal" ] && [ -r "$CLV_HOME/user/subject" ]; then
+		subject="$(head -n1 "$CLV_HOME/user/subject" | tr -d '[:space:]')"
+	else
+		subject=""
+	fi
+}
+
+cmd_whoami() {
+	resolve_identity
+	if [ "${1:-}" = "--json" ]; then
+		printf '{"principal":"%s","method":"%s","subject":"%s"}\n' \
+			"$principal" "$method" "$subject"
+		return 0
+	fi
+	printf 'principal: %s\n' "${principal:-<unknown>}"
+	printf 'method:    %s\n' "$method"
+	printf 'subject:   %s\n' "${subject:-<none>}"
+	[ "$method" = "none" ] && {
+		printf '\nNo identity established.\n'
+		printf 'Expected CLV_PRINCIPAL from an authorized_keys forced command.\n'
+		printf 'See the dev-prep pack: _claude-prep/IDENTITY-RUNBOOK.md\n'
+		return 1
+	}
+	return 0
+}
+
+# ------------------------------------------------------------------ scopes ---
+# Scope rule (prep-stage proposal, see 00_PREP-PACK.md D5):
+#   state lives at the NARROWEST scope that owns its lifecycle;
+#   reads merge upward   global -> env -> user -> dir
+#   writes land downward at the narrowest scope.
+#
+# Fixed points, established elsewhere — do not invent alternatives:
+#   credentials -> ~/.collevity/auth/
+#   run state   -> ~/.collevity/
+
+cmd_env() {
+	resolve_identity
+	printf '%-12s %s\n' "principal" "${principal:-<unknown>}"
+	printf '%-12s %s\n' "method" "$method"
+	printf '\n'
+	printf '%-12s %s\n' "global" "$CLV_HOME"
+	printf '%-12s %s\n' "creds" "$CLV_HOME/auth"
+	printf '%-12s %s\n' "env" "$CLV_ENV_ROOT"
+	printf '%-12s %s\n' "org" "$CLV_ORG_ROOT"
+	if [ -n "$principal" ]; then
+		printf '%-12s %s\n' "user" "$CLV_ENV_ROOT/users/$principal"
+	else
+		printf '%-12s %s\n' "user" "<unresolved — no principal>"
+	fi
+	printf '%-12s %s\n' "dir" "$(pwd)"
+}
+
+usage() {
+	cat <<'EOF'
+clv — identity and scope seam
+
+  clv whoami [--json]   who is acting, and how that was established
+  clv env               resolved scopes and paths
+
+Everything downstream reads identity through `clv whoami`. Nothing reads
+$USER, the SSH key, or the roster file directly.
+EOF
+}
+
+case "${1:-}" in
+	whoami) shift; cmd_whoami "$@" ;;
+	env)    shift; cmd_env "$@" ;;
+	-h|--help|help|"") usage ;;
+	*) printf 'clv: unknown subcommand: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
