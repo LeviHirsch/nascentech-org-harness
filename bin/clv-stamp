@@ -1,0 +1,77 @@
+#!/bin/sh
+# clv-stamp — emit an attribution record for an action.
+#
+# THE POINT (T3): prove a consumer can attribute an action without inventing
+# identity. Every field here comes from `clv whoami`. Nothing reads $USER, the
+# SSH key, or a roster. If `clv` is wrong, this is wrong — which is correct.
+#
+# Deliberately NOT a store. It writes one JSON object to stdout and stops.
+# Durable append lives in the org store (T9) and the action log (T11); this
+# emits the shape they will persist so there is only ever one record format.
+#
+# Fields, fixed in AGENTS.md — do not add a second vocabulary:
+#   principal  who authenticated
+#   actor      who acted (may be an agent)
+#   subject    whose Google account is being acted as
+#   method     how identity was established
+#
+# Usage:
+#   clv-stamp <action> [--actor <who>] [--note <text>]
+#
+#   clv-stamp session.start
+#   clv-stamp rr.submit --actor claude-opus-5 --note "drafted the brief"
+
+set -eu
+
+CLV="${CLV_BIN:-$(dirname "$0")/clv}"
+[ -x "$CLV" ] || CLV=clv
+
+action=""
+actor=""
+note=""
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--actor) shift; actor="${1:-}"; [ -n "$actor" ] || { echo "clv-stamp: --actor needs a value" >&2; exit 2; } ;;
+		--note)  shift; note="${1:-}" ;;
+		-h|--help)
+			echo "clv-stamp <action> [--actor <who>] [--note <text>]"
+			exit 0 ;;
+		-*) echo "clv-stamp: unknown option: $1" >&2; exit 2 ;;
+		*)  [ -z "$action" ] || { echo "clv-stamp: one action, got '$action' and '$1'" >&2; exit 2; }
+		    action="$1" ;;
+	esac
+	shift
+done
+
+[ -n "$action" ] || { echo "clv-stamp: an action name is required" >&2; exit 2; }
+
+# `clv whoami` exits non-zero when method=none. That is NOT an error here.
+# An unattributed action is a real, allowed state (AGENTS.md); the record has
+# to say so honestly rather than fail or guess a principal.
+identity="$("$CLV" whoami --json 2>/dev/null || true)"
+
+field() {
+	printf '%s' "$identity" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"
+}
+
+principal="$(field principal)"
+method="$(field method)"
+subject="$(field subject)"
+
+# No parseable answer at all — clv missing or broken. Say none; never guess.
+[ -n "$method" ] || method="none"
+
+# actor defaults to the principal: a person acting as themselves. An agent MUST
+# pass --actor, so an agent write is never recorded as the human's. This is the
+# Dropper D-002 defect, and it is prevented here rather than apologised for.
+[ -n "$actor" ] || actor="$principal"
+
+esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+printf '{"ts":"%s","action":"%s","principal":"%s","actor":"%s","subject":"%s","method":"%s"' \
+	"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+	"$(esc "$action")" "$(esc "$principal")" "$(esc "$actor")" \
+	"$(esc "$subject")" "$(esc "$method")"
+[ -n "$note" ] && printf ',"note":"%s"' "$(esc "$note")"
+printf '}\n'

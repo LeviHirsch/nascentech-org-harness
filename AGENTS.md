@@ -41,8 +41,8 @@ defect, and this is where it would become org-scale infrastructure.
 ## Layout
 
 ```
-bin/        clv, clv-login, clv-dwd, clv-dwd-verify — source of truth,
-            deployed to ~/.collevity/bin (see bin/README.md)
+bin/        clv, clv-login, clv-dwd, clv-dwd-verify, clv-stamp — source of
+            truth, deployed to ~/.collevity/bin (see bin/README.md)
 deploy-mini push bin/ to the mini. Not a clv tool; never deployed itself
 AGENTS.md   this file (CLAUDE.md is a symlink to it)
 .tasks/     dev task board — lives on the integration branch only
