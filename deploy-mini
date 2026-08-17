@@ -1,0 +1,98 @@
+#!/bin/sh
+# deploy-mini — push bin/ from this clone to the mini's ~/.collevity/bin.
+#
+# The laptop holds both halves — authenticated gh for this repo and `ssh nt`
+# for the box — so nothing needs a GitHub credential on the mini itself. That
+# was a deliberate call (T58): a deploy key is a credential to hold and rotate
+# for no gain while there is one operator and one mini.
+#
+# NOT a clv tool. Lives at the repo root on purpose so it is never deployed
+# to the mini alongside the things it deploys.
+#
+# Usage:
+#   ./deploy-mini            show what would change, change nothing
+#   ./deploy-mini --apply    copy the differing files across
+#
+# Dry-run is the default because the target is a live box.
+
+set -eu
+
+REMOTE="${CLV_MINI_HOST:-nt}"
+REMOTE_BIN="${CLV_MINI_BIN:-.collevity/bin}"
+TOOLS="clv clv-login clv-dwd clv-dwd-verify"
+
+APPLY=0
+case "${1:-}" in
+	--apply) APPLY=1 ;;
+	""|--dry-run) ;;
+	*) echo "deploy-mini: unknown argument: $1" >&2; exit 2 ;;
+esac
+
+cd "$(dirname "$0")"
+[ -d bin ] || { echo "deploy-mini: no bin/ here — run from the repo" >&2; exit 1; }
+
+# Refuse to deploy uncommitted work. What lands on the mini must be a state
+# that exists in git, or the box drifts from the source of truth again.
+if [ -n "$(git status --porcelain bin/ 2>/dev/null)" ]; then
+	echo "deploy-mini: bin/ has uncommitted changes — commit before deploying" >&2
+	exit 1
+fi
+
+echo "deploying to $REMOTE:~/$REMOTE_BIN (source: $(git rev-parse --short HEAD))"
+echo
+
+changed=""
+missing=""
+for f in $TOOLS; do
+	[ -f "bin/$f" ] || { echo "  ! bin/$f missing from the repo"; missing="$missing $f"; continue; }
+
+	remote_sum="$(ssh "$REMOTE" "shasum -a 256 ~/$REMOTE_BIN/$f 2>/dev/null | cut -d' ' -f1" || true)"
+	local_sum="$(shasum -a 256 "bin/$f" | cut -d' ' -f1)"
+
+	if [ -z "$remote_sum" ]; then
+		echo "  + $f  (not on the mini yet)"
+		changed="$changed $f"
+	elif [ "$remote_sum" != "$local_sum" ]; then
+		echo "  ~ $f  differs"
+		# Show it. "Never clobber a live tool blind" is the rule this exists for.
+		ssh "$REMOTE" "cat ~/$REMOTE_BIN/$f" 2>/dev/null > "/tmp/deploy-mini-$f.remote" || true
+		diff -u "/tmp/deploy-mini-$f.remote" "bin/$f" | sed 's/^/      /' || true
+		rm -f "/tmp/deploy-mini-$f.remote"
+		changed="$changed $f"
+	else
+		echo "  = $f  identical"
+	fi
+done
+
+[ -n "$missing" ] && { echo; echo "deploy-mini: refusing — tools missing from the repo:$missing" >&2; exit 1; }
+
+echo
+if [ -z "$changed" ]; then
+	echo "nothing to deploy — the mini matches this commit"
+	exit 0
+fi
+
+if [ "$APPLY" -eq 0 ]; then
+	echo "dry run. re-run with --apply to copy:$changed"
+	exit 0
+fi
+
+ssh "$REMOTE" "mkdir -p ~/$REMOTE_BIN"
+for f in $changed; do
+	scp -q "bin/$f" "$REMOTE:$REMOTE_BIN/$f"
+	ssh "$REMOTE" "chmod 755 ~/$REMOTE_BIN/$f"
+	echo "  deployed $f"
+done
+
+echo
+echo "verifying…"
+for f in $changed; do
+	remote_sum="$(ssh "$REMOTE" "shasum -a 256 ~/$REMOTE_BIN/$f | cut -d' ' -f1")"
+	local_sum="$(shasum -a 256 "bin/$f" | cut -d' ' -f1)"
+	if [ "$remote_sum" = "$local_sum" ]; then
+		echo "  ok  $f"
+	else
+		echo "  FAIL $f — checksum mismatch after copy" >&2
+		exit 1
+	fi
+done

@@ -43,11 +43,22 @@ defect, and this is where it would become org-scale infrastructure.
 ```
 bin/        clv, clv-login, clv-dwd, clv-dwd-verify — source of truth,
             deployed to ~/.collevity/bin (see bin/README.md)
+deploy-mini push bin/ to the mini. Not a clv tool; never deployed itself
 AGENTS.md   this file (CLAUDE.md is a symlink to it)
 .tasks/     dev task board — lives on the integration branch only
 ```
 
 No `docs/` sprawl. Docs live next to what they describe.
+
+## Deploying
+
+`./deploy-mini` from the laptop — dry-run by default, `--apply` to copy. The
+mini holds **no GitHub credential**; the laptop has both `gh` for the repo and
+`ssh nt` for the box, so it pushes rather than the mini pulling. Revisit only
+if the mini ever needs to deploy with the laptop off.
+
+`clv-login` is the SSH forced command. A broken copy locks you out of the box —
+validate at a temp path on the mini before installing over the live one.
 
 ## Invariants
 
