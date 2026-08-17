@@ -19,7 +19,22 @@ set -eu
 
 REMOTE="${CLV_MINI_HOST:-nt}"
 REMOTE_BIN="${CLV_MINI_BIN:-.collevity/bin}"
-TOOLS="clv clv-login clv-dwd clv-dwd-verify"
+
+# Tools are DISCOVERED, never listed. A hardcoded list means a tool added to
+# bin/ silently never deploys — no error, just absent from the mini. That is
+# how clv-stamp nearly shipped nowhere (T89).
+# Executable = a tool. bin/README.md is not executable, so it stays behind.
+discover_tools() {
+	for p in bin/*; do
+		if [ -f "$p" ] && [ -x "$p" ]; then
+			basename "$p"
+		fi
+	done
+	# Explicit: without this the function inherits the exit status of the last
+	# test, which is a FAILED one whenever bin/ ends in a non-executable
+	# (README.md does). Under `set -e` that killed the script with no output.
+	return 0
+}
 
 APPLY=0
 case "${1:-}" in
@@ -38,14 +53,14 @@ if [ -n "$(git status --porcelain bin/ 2>/dev/null)" ]; then
 	exit 1
 fi
 
+TOOLS="$(discover_tools)"
+[ -n "$TOOLS" ] || { echo "deploy-mini: no executables in bin/" >&2; exit 1; }
+
 echo "deploying to $REMOTE:~/$REMOTE_BIN (source: $(git rev-parse --short HEAD))"
 echo
 
 changed=""
-missing=""
 for f in $TOOLS; do
-	[ -f "bin/$f" ] || { echo "  ! bin/$f missing from the repo"; missing="$missing $f"; continue; }
-
 	remote_sum="$(ssh "$REMOTE" "shasum -a 256 ~/$REMOTE_BIN/$f 2>/dev/null | cut -d' ' -f1" || true)"
 	local_sum="$(shasum -a 256 "bin/$f" | cut -d' ' -f1)"
 
@@ -63,8 +78,6 @@ for f in $TOOLS; do
 		echo "  = $f  identical"
 	fi
 done
-
-[ -n "$missing" ] && { echo; echo "deploy-mini: refusing — tools missing from the repo:$missing" >&2; exit 1; }
 
 echo
 if [ -z "$changed" ]; then
