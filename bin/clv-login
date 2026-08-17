@@ -1,0 +1,59 @@
+#!/bin/sh
+# clv-login — forced command that stamps a principal onto an SSH session.
+#
+# Invoked from ~/.ssh/authorized_keys, one entry per person:
+#
+#   command="/Users/nascentech/.collevity/bin/clv-login levi",no-agent-forwarding ssh-ed25519 AAAA... levi@nt
+#
+# Identity comes from which private key authenticated, so it is cryptographic
+# rather than self-declared. The principal is baked into the authorized_keys
+# line, which only someone with write access to that file can change.
+#
+# WHY a forced command and not `environment="CLV_PRINCIPAL=..."`:
+# PermitUserEnvironment is `no` on this box (commented default in
+# /etc/ssh/sshd_config) and enabling it needs sudo, which needs a password.
+# A forced command needs neither, requires no sshd restart, and is undone by
+# editing one line — which matters on a box reachable only through the tunnel.
+#
+# UPGRADE PATH: when Cloudflare Access short-lived certificates land, the
+# principal comes from the cert instead and this wrapper goes away. Nothing
+# downstream changes, because nothing downstream reads this file — they read
+# `clv whoami`.
+#
+# LIMIT, state it honestly: this authenticates the KEY, not the human. A shared
+# key is a shared principal. It does not isolate — everyone still has the same
+# uid and can read everything. It makes attribution honest, not enforced.
+
+set -eu
+
+CLV_PRINCIPAL="${1:-}"
+if [ -z "$CLV_PRINCIPAL" ]; then
+	echo "clv-login: no principal configured in authorized_keys entry" >&2
+	exit 1
+fi
+export CLV_PRINCIPAL
+export CLV_PRINCIPAL_METHOD=ssh-key
+
+# Ensure the principal's user tree exists. `clv env` computes this path but
+# deliberately does not create it: whoami/env are pure reads, called constantly,
+# and a read that mutates the filesystem is a defect. Session entry is the one
+# place identity is newly established, so the mkdir belongs here.
+#
+# Non-fatal on purpose. A box reachable only through the tunnel must not become
+# unloggable because a directory could not be made.
+CLV_ENV_ROOT="${CLV_ENV_ROOT:-$HOME/nascentech-env}"
+if ! mkdir -p "$CLV_ENV_ROOT/users/$CLV_PRINCIPAL" 2>/dev/null; then
+	echo "clv-login: warning: could not create $CLV_ENV_ROOT/users/$CLV_PRINCIPAL" >&2
+fi
+
+# Resolve the login shell without depending on $SHELL, which sshd does not set
+# for forced commands.
+login_shell="$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | awk '{print $2}')"
+[ -x "${login_shell:-}" ] || login_shell=/bin/zsh
+
+if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+	# non-interactive: `ssh nt <cmd>`, scp, sftp, rsync
+	exec "$login_shell" -c "$SSH_ORIGINAL_COMMAND"
+else
+	exec "$login_shell" -l
+fi

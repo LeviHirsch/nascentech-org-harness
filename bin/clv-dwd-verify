@@ -1,0 +1,117 @@
+#!/usr/bin/env -S uv run --quiet --with google-auth --with google-api-python-client --script
+"""Prove DWD impersonation for two subjects. No SA key — signJwt via mini@."""
+import json
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+SA_META = Path("/Users/nascentech/.collevity/auth/_service/sa.json")
+USER_TOKEN = Path("/Users/nascentech/.collevity/auth/tokens/mini@nascentech.com.json")
+
+PROOF_SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/tasks",
+]
+
+
+def source_access_token():
+    data = json.loads(USER_TOKEN.read_text())
+    creds = Credentials(
+        token=data.get("token"),
+        refresh_token=data.get("refresh_token"),
+        token_uri=data.get("token_uri") or "https://oauth2.googleapis.com/token",
+        client_id=data["client_id"],
+        client_secret=data["client_secret"],
+        scopes=data.get("scopes"),
+    )
+    if not creds.valid:
+        creds.refresh(Request())
+    return creds.token
+
+
+def sign_jwt(source_token, sa_email, subject):
+    now = int(time.time())
+    claim = {
+        "iss": sa_email,
+        "sub": subject,
+        "aud": "https://oauth2.googleapis.com/token",
+        "iat": now,
+        "exp": now + 3600,
+        "scope": " ".join(PROOF_SCOPES),
+    }
+    url = (
+        "https://iamcredentials.googleapis.com/v1/projects/-"
+        f"/serviceAccounts/{sa_email}:signJwt"
+    )
+    body = json.dumps({"payload": json.dumps(claim)}).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {source_token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())["signedJwt"]
+    except urllib.error.HTTPError as e:
+        err = e.read().decode(errors="replace")
+        sys.exit(f"signJwt failed HTTP {e.code} for {subject}:\n{err}")
+
+
+def exchange_jwt(signed_jwt):
+    data = urllib.parse.urlencode(
+        {
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": signed_jwt,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token", data=data, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())["access_token"]
+    except urllib.error.HTTPError as e:
+        err = e.read().decode(errors="replace")
+        sys.exit(f"JWT exchange failed HTTP {e.code}:\n{err}")
+
+
+def check(sa_email, source_token, subject):
+    print(f"\n=== impersonating {subject} ===")
+    access = exchange_jwt(sign_jwt(source_token, sa_email, subject))
+    creds = Credentials(token=access)
+    cal = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    cals = cal.calendarList().list(maxResults=5).execute().get("items", [])
+    print(f"  calendars: {len(cals)} -> {[c.get('id') for c in cals][:3]}")
+    drv = build("drive", "v3", credentials=creds, cache_discovery=False)
+    me = drv.about().get(fields="user").execute()["user"]
+    print(f"  drive identity: {me.get('emailAddress')}")
+    got = (me.get("emailAddress") or "").lower()
+    if got != subject.lower():
+        sys.exit(f"  MISMATCH: acting as {got}, expected {subject}")
+    print("  OK")
+
+
+if __name__ == "__main__":
+    subjects = sys.argv[1:]
+    if len(subjects) < 2:
+        sys.exit("usage: clv-dwd-verify <subject1> <subject2>")
+    meta = json.loads(SA_META.read_text())
+    sa_email = meta["email"]
+    src = source_access_token()
+    print(f"SA {sa_email}")
+    print(f"auth signJwt via mini@ (no key file)")
+    for s in subjects:
+        check(sa_email, src, s)
+    print("\nDWD verified for", len(subjects), "subjects.")

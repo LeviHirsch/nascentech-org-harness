@@ -1,0 +1,247 @@
+#!/usr/bin/env -S uv run --quiet --with google-auth --with google-api-python-client --script
+"""Google DWD from the mini — no SA key. signJwt via mini@ Token Creator.
+
+  clv-dwd as <email>                         print Google identity
+  clv-dwd verify <email1> <email2>           two-subject proof
+  clv-dwd users                              domain directory (DWD as super-admin)
+  clv-dwd send --as <email> --to <email> \\
+          --subject <text> --body <text>     send mail as subject
+  clv-dwd task --as <email> --title <text> \\
+          [--due YYYY-MM-DD]                 add task to subject's @default list
+  clv-dwd event --as <email> --summary <text> \\
+          --start <iso> --end <iso> [--tz <tz>]  add event to subject's calendar
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from email.mime.text import MIMEText
+from pathlib import Path
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+SA_META = Path("/Users/nascentech/.collevity/auth/_service/sa.json")
+USER_TOKEN = Path("/Users/nascentech/.collevity/auth/tokens/mini@nascentech.com.json")
+
+
+def sa_email() -> str:
+    return json.loads(SA_META.read_text())["email"]
+
+
+def source_token() -> str:
+    d = json.loads(USER_TOKEN.read_text())
+    c = Credentials(
+        token=d.get("token"),
+        refresh_token=d.get("refresh_token"),
+        token_uri=d.get("token_uri") or "https://oauth2.googleapis.com/token",
+        client_id=d["client_id"],
+        client_secret=d["client_secret"],
+        scopes=d.get("scopes"),
+    )
+    if not c.valid:
+        c.refresh(Request())
+    return c.token
+
+
+def as_user(subject: str, scopes: list[str]) -> Credentials:
+    now = int(time.time())
+    claim = {
+        "iss": sa_email(),
+        "sub": subject,
+        "aud": "https://oauth2.googleapis.com/token",
+        "iat": now,
+        "exp": now + 3600,
+        "scope": " ".join(scopes),
+    }
+    url = (
+        "https://iamcredentials.googleapis.com/v1/projects/-"
+        "/serviceAccounts/%s:signJwt" % sa_email()
+    )
+    body = json.dumps({"payload": json.dumps(claim)}).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + source_token(),
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            signed = json.loads(resp.read())["signedJwt"]
+    except urllib.error.HTTPError as e:
+        sys.exit("signJwt HTTP %s: %s" % (e.code, e.read().decode(errors="replace")))
+    data = urllib.parse.urlencode(
+        {
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": signed,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token", data=data, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return Credentials(token=json.loads(resp.read())["access_token"])
+    except urllib.error.HTTPError as e:
+        sys.exit(
+            "token HTTP %s: %s\n"
+            "DWD JWT scopes must be exact strings from the Admin grant "
+            "(gmail.modify is not gmail.readonly)."
+            % (e.code, e.read().decode(errors="replace"))
+        )
+
+
+def cmd_as(email: str) -> None:
+    creds = as_user(
+        email,
+        [
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    drv = build("drive", "v3", credentials=creds, cache_discovery=False)
+    prof = gmail.users().getProfile(userId="me").execute()
+    me = drv.about().get(fields="user").execute()["user"]
+    print("subject:", email)
+    print("gmail:", prof.get("emailAddress"), "messages=%s" % prof.get("messagesTotal"))
+    print("drive:", me.get("emailAddress"), me.get("displayName"))
+    if (prof.get("emailAddress") or "").lower() != email.lower():
+        sys.exit("mismatch")
+
+
+def cmd_verify(a: str, b: str) -> None:
+    cmd_as(a)
+    print("---")
+    cmd_as(b)
+    print("verified", a, "and", b)
+
+
+ADMIN_SUBJECT = "levi@nascentech.com"
+
+
+def cmd_users() -> None:
+    creds = as_user(
+        ADMIN_SUBJECT,
+        ["https://www.googleapis.com/auth/admin.directory.user.readonly"],
+    )
+    directory = build("admin", "directory_v1", credentials=creds, cache_discovery=False)
+    users = (
+        directory.users()
+        .list(customer="my_customer", maxResults=100, orderBy="email")
+        .execute()
+        .get("users", [])
+    )
+    print("as", ADMIN_SUBJECT, "count", len(users))
+    for u in users:
+        print(u.get("primaryEmail"), "|", (u.get("name") or {}).get("fullName"))
+
+
+def cmd_send(as_email: str, to: str, subject: str, body: str) -> None:
+    creds = as_user(as_email, ["https://www.googleapis.com/auth/gmail.send"])
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["to"] = to
+    msg["from"] = as_email
+    msg["subject"] = subject
+    gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    sent = gmail.users().messages().send(userId="me", body={"raw": raw}).execute()
+    print("from", as_email)
+    print("to", to)
+    print("id", sent.get("id"))
+    print("thread", sent.get("threadId"))
+
+
+def cmd_task(as_email: str, title: str, due: str | None) -> None:
+    creds = as_user(as_email, ["https://www.googleapis.com/auth/tasks"])
+    tasks = build("tasks", "v1", credentials=creds, cache_discovery=False)
+    body = {"title": title}
+    if due:
+        body["due"] = due + "T00:00:00.000Z"
+    t = tasks.tasks().insert(tasklist="@default", body=body).execute()
+    print("as", as_email)
+    print("task", t.get("title"))
+    print("due", (t.get("due") or "-"))
+    print("id", t.get("id"))
+
+
+def cmd_event(as_email: str, summary: str, start: str, end: str, tz: str) -> None:
+    creds = as_user(as_email, ["https://www.googleapis.com/auth/calendar"])
+    cal = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    ev = (
+        cal.events()
+        .insert(
+            calendarId="primary",
+            body={
+                "summary": summary,
+                "start": {"dateTime": start, "timeZone": tz},
+                "end": {"dateTime": end, "timeZone": tz},
+            },
+        )
+        .execute()
+    )
+    print("as", as_email)
+    print("event", ev.get("summary"))
+    print("when", ev["start"].get("dateTime"), "->", ev["end"].get("dateTime"))
+    print("id", ev.get("id"))
+    print("link", ev.get("htmlLink"))
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="clv-dwd")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_as = sub.add_parser("as", help="print Google identity for a subject")
+    p_as.add_argument("email")
+
+    p_v = sub.add_parser("verify", help="two-subject proof")
+    p_v.add_argument("email1")
+    p_v.add_argument("email2")
+
+    sub.add_parser("users", help="list domain users (Admin SDK via DWD)")
+
+    p_s = sub.add_parser("send", help="send mail as a subject")
+    p_s.add_argument("--as", dest="as_email", required=True)
+    p_s.add_argument("--to", required=True)
+    p_s.add_argument("--subject", required=True)
+    p_s.add_argument("--body", required=True)
+
+    p_t = sub.add_parser("task", help="add a task as a subject")
+    p_t.add_argument("--as", dest="as_email", required=True)
+    p_t.add_argument("--title", required=True)
+    p_t.add_argument("--due", help="YYYY-MM-DD (date only; Tasks ignores time)")
+
+    p_e = sub.add_parser("event", help="add a calendar event as a subject")
+    p_e.add_argument("--as", dest="as_email", required=True)
+    p_e.add_argument("--summary", required=True)
+    p_e.add_argument("--start", required=True, help="YYYY-MM-DDTHH:MM:SS (local to --tz)")
+    p_e.add_argument("--end", required=True, help="YYYY-MM-DDTHH:MM:SS (local to --tz)")
+    p_e.add_argument("--tz", default="America/New_York")
+
+    args = p.parse_args()
+    if args.cmd == "as":
+        cmd_as(args.email)
+    elif args.cmd == "verify":
+        cmd_verify(args.email1, args.email2)
+    elif args.cmd == "users":
+        cmd_users()
+    elif args.cmd == "send":
+        cmd_send(args.as_email, args.to, args.subject, args.body)
+    elif args.cmd == "task":
+        cmd_task(args.as_email, args.title, args.due)
+    elif args.cmd == "event":
+        cmd_event(args.as_email, args.summary, args.start, args.end, args.tz)
+
+
+if __name__ == "__main__":
+    main()
