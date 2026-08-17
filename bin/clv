@@ -43,12 +43,27 @@ resolve_identity() {
 
 	# subject = who we act on behalf of in Google (the DWD impersonation
 	# target). Distinct from principal on purpose; see BRIEF.md §4.
+	#
+	# KEYED BY PRINCIPAL, and it must stay that way. Every session on this box
+	# is uid 502, so $CLV_HOME is one directory shared by everyone. A single
+	# user/subject file would hand whoever wrote it to every principal that
+	# asks — levi silently acting as sabrina's Google account. That breaks the
+	# invariant that the harness refuses to act as a subject other than
+	# whoami's, so the principal is part of the path.
 	if [ -n "${CLV_SUBJECT:-}" ]; then
 		subject="$CLV_SUBJECT"
-	elif [ -n "$principal" ] && [ -r "$CLV_HOME/user/subject" ]; then
-		subject="$(head -n1 "$CLV_HOME/user/subject" | tr -d '[:space:]')"
+	elif [ -n "$principal" ] && [ -r "$CLV_HOME/user/$principal/subject" ]; then
+		subject="$(head -n1 "$CLV_HOME/user/$principal/subject" | tr -d '[:space:]')"
 	else
 		subject=""
+	fi
+
+	# The old shared location is never read. Warning, not silence: a file
+	# someone wrote expecting it to work has stopped working, and a subject
+	# that quietly evaporates is as bad as one that quietly leaks. stderr so
+	# `whoami --json` stays parseable.
+	if [ -e "$CLV_HOME/user/subject" ]; then
+		echo "clv: ignoring $CLV_HOME/user/subject — subjects are per-principal now; move it to $CLV_HOME/user/<principal>/subject" >&2
 	fi
 }
 
