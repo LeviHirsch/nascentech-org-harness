@@ -13,3 +13,4 @@
 - workspace: Mail, calendar, tasks, Docs, Sheets as a person
 - env: Shared base everyone gets: env-level guidance, settings, installed skills, availability (clv's env scope)
 - deploy: deploy-mini; keeping the mini identical to the repo
+- user: Own space per person: folder, AI settings and brief, git name (clv's user scope)
