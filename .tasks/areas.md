@@ -9,7 +9,7 @@
 - entry: Front door: clv-login, authorized_keys binding, name checks, registration helper, SSH setup
 - orchestrate: Org /orchestrate pass: judge and hand off, do not do the thread work
 - agents: How agents attach: CLI surface, one SDK wedge, actor vs model account vs DWD
-- dwd: signJwt impersonation client; subject switch; not MCP
+- dwd: clv-dwd tools on the service-account key: impersonation, health, watch
 - workspace: Mail, calendar, tasks, Docs, Sheets as a person
 - env: Shared base everyone gets: env-level guidance, settings, installed skills, availability (clv's env scope)
 - deploy: deploy-mini; keeping the mini identical to the repo
