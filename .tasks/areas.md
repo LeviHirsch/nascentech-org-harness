@@ -1,7 +1,7 @@
 # Areas
 
 - capture: Own dropper: capture writers, the store, views; the harness action log
-- skills: Org skills read whoami; later skill-driven triggers
+- skills: Org skills on the mini: install path, reading whoami, the capabilities list
 - sessions: Org session packages on the mini; retrieval later
 - nodes: Directory work surfaces; address is the full path; agent and human share the node
 - threads: Org thread/project/task assignment and Workspace surfacing
