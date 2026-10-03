@@ -15,3 +15,4 @@
 - deploy: deploy-mini; keeping the mini identical to the repo
 - user: Own space per person: folder, AI settings and brief, git name (clv's user scope)
 - guardrails: House rules in code: AI permission rules, tamper checks, refusals
+- kit: Client kit: the package and commands installed on people's laptops
