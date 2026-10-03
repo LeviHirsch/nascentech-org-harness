@@ -11,3 +11,4 @@
 - agents: How agents attach: CLI surface, one SDK wedge, actor vs model account vs DWD
 - dwd: signJwt impersonation client; subject switch; not MCP
 - workspace: Mail, calendar, tasks, Docs, Sheets as a person
+- env: Shared base everyone gets: env-level guidance, settings, installed skills, availability (clv's env scope)
