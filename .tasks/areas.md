@@ -10,7 +10,7 @@
 - orchestrate: Org /orchestrate pass: judge and hand off, do not do the thread work
 - agents: How agents attach: CLI surface, one SDK wedge, actor vs model account vs DWD
 - dwd: clv-dwd tools on the service-account key: impersonation, health, watch
-- workspace: Mail, calendar, tasks, Docs, Sheets as a person
+- workspace: Mail, calendar, tasks, Docs, Sheets as a person; workspace-mcp
 - env: Shared base everyone gets: env-level guidance, settings, installed skills, availability (clv's env scope)
 - deploy: deploy-mini; keeping the mini identical to the repo
 - user: Own space per person: folder, AI settings and brief, git name (clv's user scope)
