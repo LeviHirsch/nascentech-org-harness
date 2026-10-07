@@ -3,10 +3,8 @@
 
 The chain, and what breaks it:
 
-  1 token     mini@ refresh token alive          -> invalid_grant (consent screen
-                                                    fell out of "In production")
-  2 signJwt   mini@ has Token Creator on the SA  -> 403 PERMISSION_DENIED
-    + IAM Credentials API enabled                -> 403 SERVICE_DISABLED
+  1 key       SA key file present, well-formed   -> clv-dwd exits "missing SA key"
+  2 sign      the key signs a JWT offline        -> bad or truncated private key
   3 scopes    per-scope DWD grant in Admin       -> 401 unauthorized_client
   4 subjects  subject resolves, API answers      -> invalid_grant / API 403
   5 write     create/delete round-trip           -> API 403 on insert
@@ -28,8 +26,6 @@ import json
 import sys
 import time
 import urllib.error
-import urllib.parse
-import urllib.request
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -43,14 +39,7 @@ from googleapiclient.errors import HttpError
 
 HOME = Path("/Users/nascentech")
 SA_META = HOME / ".collevity/auth/_service/sa.json"
-USER_TOKEN = HOME / ".collevity/auth/tokens/mini@nascentech.com.json"
 SA_KEY = HOME / ".collevity/auth/_service/sa-key.json"
-
-# "key"   = SA signs its own JWTs locally. No user credential, nothing that
-#           expires on a human-session clock. The target shape.
-# "token" = legacy: mini@ user token -> signJwt -> exchange. Works, but dies
-#           on the reauth clock, which is the whole reason for the migration.
-MODE = "key" if SA_KEY.exists() else "token"
 
 DEFAULT_SUBJECTS = [
     "levi@nascentech.com",
@@ -95,14 +84,21 @@ SUBSUMED = {
 }
 
 # What each clv-dwd subcommand actually asks for. A grant gap only matters if it
-# breaks one of these.
+# breaks one of these. Keep in step with clv-dwd: a command missing here is a
+# command this check says nothing about.
+_GMAIL, _DRIVE, _CAL = [B + "gmail.modify"], [B + "drive"], [B + "calendar"]
+_TASKS, _SHEETS = [B + "tasks"], [B + "spreadsheets"]
 CONSUMERS = {
-    "clv-dwd as": [B + "gmail.modify", B + "drive"],
-    "clv-dwd verify": [B + "calendar", B + "drive", B + "tasks"],
-    "clv-dwd users": [B + "admin.directory.user.readonly"],
-    "clv-dwd send": [B + "gmail.send"],
-    "clv-dwd task": [B + "tasks"],
-    "clv-dwd event": [B + "calendar"],
+    "as": [B + "gmail.modify", B + "drive"],
+    "verify": [B + "gmail.modify", B + "drive"],
+    "users": [B + "admin.directory.user.readonly"],
+    "send": [B + "gmail.send"],
+    **{c: _GMAIL for c in ("mail", "msg", "draft", "draft-delete", "labels", "label")},
+    **{c: _CAL for c in ("event", "agenda", "calendars", "event-update", "event-delete")},
+    **{c: _TASKS for c in ("task", "tasks", "task-done", "task-delete")},
+    **{c: _DRIVE for c in ("files", "file", "copy", "mkdir", "upload", "update", "trash",
+                           "export", "perms", "share", "unshare")},
+    **{c: _SHEETS for c in ("sheet", "sheet-append", "sheet-write")},
 }
 
 OK = "PASS"
@@ -126,64 +122,8 @@ def http_err(e: urllib.error.HTTPError) -> tuple[int, dict, str]:
         return e.code, {}, raw
 
 
-REFRESH_HINTS = {
-    "invalid_rapt": (
-        "Google Cloud session control expired the reauth proof.\n"
-        "  The token carries cloud-platform scope, so it is governed by the\n"
-        "  Workspace GCP session-length policy, not by the token's own lifetime.\n"
-        "  A headless box cannot satisfy an interactive reauth, so this recurs\n"
-        "  on the policy clock until the policy changes.\n"
-        "  Fix: Admin console -> Security -> Access and data control ->\n"
-        "  Google Cloud session control -> 'Session never expires' for the OU\n"
-        "  holding mini@. Then re-mint the token once."
-    ),
-    "invalid_token": (
-        "Refresh token revoked or superseded.\n"
-        "  Someone re-ran the consent flow, revoked app access, or the account\n"
-        "  password changed. Re-mint."
-    ),
-}
-TESTING_HINT = (
-    "If the OAuth consent screen is in Testing rather than In production,\n"
-    "  refresh tokens expire after 7 days regardless of anything else.\n"
-    "  Check the publishing status before re-minting."
-)
-
-
-def explain_refresh_failure(data: dict) -> None:
-    """Re-issue the refresh bare so the error_subtype survives."""
-    body = urllib.parse.urlencode(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": data["refresh_token"],
-            "client_id": data["client_id"],
-            "client_secret": data["client_secret"],
-        }
-    ).encode()
-    req = urllib.request.Request(
-        "https://oauth2.googleapis.com/token", data=body, method="POST"
-    )
-    subtype = desc = ""
-    try:
-        urllib.request.urlopen(req).read()
-        print("\n  Bare refresh succeeded on retry - transient. Re-run.")
-        return
-    except urllib.error.HTTPError as e:
-        _, parsed, raw = http_err(e)
-        subtype = parsed.get("error_subtype", "")
-        desc = parsed.get("error_description", raw[:200])
-
-    print(f"\n  error_subtype: {subtype or '(none)'}  |  {desc}")
-    print("\n  " + REFRESH_HINTS.get(subtype, TESTING_HINT))
-    print(
-        "\n  NOTE: the SA is keyless (sa.json auth=signJwt, no private key), so\n"
-        "  every rung above this one depends on this token. Nothing downstream\n"
-        "  can be tested until it is re-minted."
-    )
-
-
 # ------------------------------------------------------------------ rung 1 ---
-def rung1_key() -> tuple[str, str]:
+def rung1_key() -> str:
     """Validate the SA key locally. No network: that is the entire point."""
     print("\n=== rung 1: SA key (local, offline) ===")
     try:
@@ -208,86 +148,10 @@ def rung1_key() -> tuple[str, str]:
         sys.exit(1)
     record("1 key identity", OK, k["client_email"])
     record("1 no user credential", OK, "auth needs no mini@ token, no reauth clock")
-    return "", k["client_email"]
-
-
-def rung1_token() -> tuple[str, str]:
-    """Refresh mini@ and prove the access token names a real identity."""
-    print("\n=== rung 1: mini@ source credential (legacy shape) ===")
-    try:
-        data = json.loads(USER_TOKEN.read_text())
-    except Exception as e:
-        record("1 token file readable", NO, f"{USER_TOKEN}: {e}")
-        sys.exit(1)
-
-    creds = Credentials(
-        token=data.get("token"),
-        refresh_token=data.get("refresh_token"),
-        token_uri=data.get("token_uri") or "https://oauth2.googleapis.com/token",
-        client_id=data["client_id"],
-        client_secret=data["client_secret"],
-        scopes=data.get("scopes"),
-    )
-    try:
-        creds.refresh(Request())
-    except Exception as e:
-        # google-auth flattens the useful part away, so ask the token endpoint
-        # directly. invalid_grant has several subtypes and they want different
-        # fixes; guessing between them costs an afternoon.
-        record("1 refresh token alive", NO, str(e).splitlines()[0])
-        explain_refresh_failure(data)
-        sys.exit(1)
-    record("1 refresh token alive", OK, "refreshed")
-
-    req = urllib.request.Request(
-        "https://www.googleapis.com/oauth2/v3/userinfo",
-        headers={"Authorization": "Bearer " + creds.token},
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            info = json.loads(resp.read())
-        record("1 token identity", OK, info.get("email", "?"))
-    except urllib.error.HTTPError as e:
-        code, _, raw = http_err(e)
-        record("1 token identity", NO, f"HTTP {code} {raw[:120]}")
-
-    granted = set(data.get("scopes") or [])
-    if B + "cloud-platform" in granted:
-        record("1 cloud-platform scope", OK, "present (needed for signJwt)")
-    else:
-        record("1 cloud-platform scope", NO, "absent - signJwt will 403")
-
-    return creds.token, json.loads(SA_META.read_text())["email"]
+    return k["client_email"]
 
 
 # ------------------------------------------------------------------ rung 2 ---
-def sign_jwt(source_token: str, sa: str, subject: str, scopes: list[str]) -> str:
-    now = int(time.time())
-    claim = {
-        "iss": sa,
-        "sub": subject,
-        "aud": "https://oauth2.googleapis.com/token",
-        "iat": now,
-        "exp": now + 3600,
-        "scope": " ".join(scopes),
-    }
-    url = (
-        "https://iamcredentials.googleapis.com/v1/projects/-"
-        f"/serviceAccounts/{sa}:signJwt"
-    )
-    req = urllib.request.Request(
-        url,
-        data=json.dumps({"payload": json.dumps(claim)}).encode(),
-        method="POST",
-        headers={
-            "Authorization": "Bearer " + source_token,
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())["signedJwt"]
-
-
 def rung2_local_sign(sa: str) -> None:
     """Sign offline with the private key. Proves independence from IAM entirely."""
     print("\n=== rung 2: local JWT signing (no network, no IAM) ===")
@@ -308,90 +172,36 @@ def rung2_local_sign(sa: str) -> None:
         sys.exit(1)
 
 
-def rung2_signjwt(source_token: str, sa: str) -> None:
-    """Sign but deliberately do not exchange - isolates IAM from the Admin grant."""
-    print("\n=== rung 2: signJwt (IAM binding + API enablement) ===")
-    print(f"  SA {sa}")
-    try:
-        jwt = sign_jwt(source_token, sa, ADMIN_SUBJECT, [B + "drive"])
-        record("2 signJwt", OK, f"signed, {len(jwt)} chars (not exchanged)")
-    except urllib.error.HTTPError as e:
-        code, parsed, raw = http_err(e)
-        reason = ""
-        try:
-            details = parsed["error"].get("details", [])
-            for d in details:
-                if d.get("reason"):
-                    reason = d["reason"]
-                    break
-            if not reason:
-                reason = parsed["error"].get("status", "")
-        except Exception:
-            pass
-        if "SERVICE_DISABLED" in raw:
-            record("2 signJwt", NO, f"HTTP {code} SERVICE_DISABLED")
-            print(
-                "\n  IAM Credentials API is off for the project. Enable\n"
-                "  iamcredentials.googleapis.com and re-run."
-            )
-        elif code == 403:
-            record("2 signJwt", NO, f"HTTP {code} {reason or 'PERMISSION_DENIED'}")
-            print(
-                "\n  mini@ is missing roles/iam.serviceAccountTokenCreator on the SA.\n"
-                "  Grant it on the service account itself, not the project."
-            )
-        else:
-            record("2 signJwt", NO, f"HTTP {code} {raw[:160]}")
-        sys.exit(1)
-
-
 # ------------------------------------------------------------------ rung 3 ---
-def exchange(jwt: str) -> str:
-    data = urllib.parse.urlencode(
-        {
-            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            "assertion": jwt,
+def token_for(subject: str, scopes: list[str]) -> str:
+    # google-auth does sign-then-exchange internally and raises RefreshError.
+    # Translate to HTTPError carrying the token endpoint's JSON, which is what
+    # every call site below parses.
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            str(SA_KEY), scopes=scopes, subject=subject
+        )
+        creds.refresh(Request())
+        return creds.token
+    except RefreshError as e:
+        payload = next((a for a in e.args if isinstance(a, dict)), None) or {
+            "error": "unauthorized_client",
+            "error_description": str(e.args[0] if e.args else e),
         }
-    ).encode()
-    req = urllib.request.Request(
-        "https://oauth2.googleapis.com/token", data=data, method="POST"
-    )
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())["access_token"]
+        raise urllib.error.HTTPError(
+            "https://oauth2.googleapis.com/token", 401, "Unauthorized", {},
+            io.BytesIO(json.dumps(payload).encode()),
+        ) from None
 
 
-def token_for(source_token: str, sa: str, subject: str, scopes: list[str]) -> str:
-    if MODE == "key":
-        # google-auth does sign-then-exchange internally and raises RefreshError
-        # where the legacy path raises HTTPError. Translate, so the dozen call
-        # sites that already parse the token endpoint's JSON keep working and
-        # the two modes stay diff-able.
-        try:
-            creds = service_account.Credentials.from_service_account_file(
-                str(SA_KEY), scopes=scopes, subject=subject
-            )
-            creds.refresh(Request())
-            return creds.token
-        except RefreshError as e:
-            payload = next((a for a in e.args if isinstance(a, dict)), None) or {
-                "error": "unauthorized_client",
-                "error_description": str(e.args[0] if e.args else e),
-            }
-            raise urllib.error.HTTPError(
-                "https://oauth2.googleapis.com/token", 401, "Unauthorized", {},
-                io.BytesIO(json.dumps(payload).encode()),
-            ) from None
-    return exchange(sign_jwt(source_token, sa, subject, scopes))
-
-
-def rung3_scopes(source_token: str, sa: str, probe_subject: str) -> dict[str, bool]:
+def rung3_scopes(probe_subject: str) -> dict[str, bool]:
     """One exchange per scope string. This is the rung the old tools skip."""
     print(f"\n=== rung 3: per-scope DWD grant (probing as {probe_subject}) ===")
     granted: dict[str, bool] = {}
     for label, scope in BROAD_SCOPES:
         subject = ADMIN_SUBJECT if "admin.directory" in scope else probe_subject
         try:
-            token_for(source_token, sa, subject, [scope])
+            token_for(subject, [scope])
             granted[scope] = True
             record(f"3 scope {label}", OK, "granted")
         except urllib.error.HTTPError as e:
@@ -415,24 +225,26 @@ def rung3_scopes(source_token: str, sa: str, probe_subject: str) -> dict[str, bo
         print(f"    {narrow.rsplit('/', 1)[1]:<26} {state}")
 
     print("\n  consumer readiness:")
+    broken = 0
     for name, needs in CONSUMERS.items():
         missing = [n.rsplit("/", 1)[1] for n in needs if not granted.get(n)]
         if missing:
-            record(f"3 consumer {name}", NO, "missing " + ", ".join(missing))
-        else:
-            record(f"3 consumer {name}", OK, "all scopes granted")
+            broken += 1
+            record(f"3 consumer clv-dwd {name}", NO, "missing " + ", ".join(missing))
+    if not broken:
+        record("3 consumers", OK, f"all {len(CONSUMERS)} clv-dwd commands have their scopes")
     return granted
 
 
 # ------------------------------------------------------------------ rung 4 ---
-def rung4_subjects(source_token: str, sa: str, subjects: list[str]) -> list[str]:
+def rung4_subjects(subjects: list[str]) -> list[str]:
     """Identity echo per subject. Read-only."""
     print("\n=== rung 4: subject impersonation (read-only) ===")
     alive: list[str] = []
     for subject in subjects:
         try:
             # Use the BROAD scopes - the narrow ones are not in the grant.
-            tok = token_for(source_token, sa, subject, [B + "drive", B + "calendar"])
+            tok = token_for(subject, [B + "drive", B + "calendar"])
         except urllib.error.HTTPError as e:
             _, parsed, raw = http_err(e)
             desc = parsed.get("error_description") or raw[:120]
@@ -463,13 +275,13 @@ def rung4_subjects(source_token: str, sa: str, subjects: list[str]) -> list[str]
     return alive
 
 
-def rung4_directory(source_token: str, sa: str, granted: dict[str, bool]) -> None:
+def rung4_directory(granted: dict[str, bool]) -> None:
     scope = B + "admin.directory.user.readonly"
     if not granted.get(scope):
         record("4 directory listing", WARN, "skipped - scope not granted")
         return
     try:
-        tok = token_for(source_token, sa, ADMIN_SUBJECT, [scope])
+        tok = token_for(ADMIN_SUBJECT, [scope])
         d = build("admin", "directory_v1", credentials=Credentials(token=tok),
                   cache_discovery=False)
         users = (
@@ -490,9 +302,9 @@ STAMP = time.strftime("%Y%m%d-%H%M%S")
 TAG = f"clv-dwd-health {STAMP}"
 
 
-def probe_task(source_token: str, sa: str, subject: str) -> None:
+def probe_task(subject: str) -> None:
     try:
-        tok = token_for(source_token, sa, subject, [B + "tasks"])
+        tok = token_for(subject, [B + "tasks"])
         api = build("tasks", "v1", credentials=Credentials(token=tok),
                     cache_discovery=False)
         t = api.tasks().insert(tasklist="@default", body={"title": TAG}).execute()
@@ -511,12 +323,12 @@ def probe_task(source_token: str, sa: str, subject: str) -> None:
         record(f"5 {subject} task cleanup", NO, f"HTTP {e.resp.status} - LEFTOVER {t['id']}")
 
 
-def probe_event(source_token: str, sa: str, subject: str) -> None:
+def probe_event(subject: str) -> None:
     start = time.gmtime(time.time() + 86400 * 400)
     s = time.strftime("%Y-%m-%dT%H:00:00", start)
     e_ = time.strftime("%Y-%m-%dT%H:30:00", start)
     try:
-        tok = token_for(source_token, sa, subject, [B + "calendar"])
+        tok = token_for(subject, [B + "calendar"])
         api = build("calendar", "v3", credentials=Credentials(token=tok),
                     cache_discovery=False)
         ev = api.events().insert(
@@ -545,10 +357,10 @@ def probe_event(source_token: str, sa: str, subject: str) -> None:
                f"HTTP {ex.resp.status} - LEFTOVER {ev['id']}")
 
 
-def probe_draft(source_token: str, sa: str, subject: str) -> None:
+def probe_draft(subject: str) -> None:
     """Draft create/delete: exercises the gmail write path with zero delivery."""
     try:
-        tok = token_for(source_token, sa, subject, [B + "gmail.modify"])
+        tok = token_for(subject, [B + "gmail.modify"])
         api = build("gmail", "v1", credentials=Credentials(token=tok),
                     cache_discovery=False)
         msg = MIMEText(TAG, "plain", "utf-8")
@@ -573,10 +385,10 @@ def probe_draft(source_token: str, sa: str, subject: str) -> None:
                f"HTTP {e.resp.status} - LEFTOVER draft {d['id']}")
 
 
-def probe_send(source_token: str, sa: str, subject: str) -> None:
+def probe_send(subject: str) -> None:
     """Real send, subject to themselves, then trash both copies."""
     try:
-        tok = token_for(source_token, sa, subject, [B + "gmail.send"])
+        tok = token_for(subject, [B + "gmail.send"])
         send_api = build("gmail", "v1", credentials=Credentials(token=tok),
                          cache_discovery=False)
         msg = MIMEText(
@@ -598,7 +410,7 @@ def probe_send(source_token: str, sa: str, subject: str) -> None:
 
     # Cleanup needs gmail.modify; send alone cannot trash.
     try:
-        tok2 = token_for(source_token, sa, subject, [B + "gmail.modify"])
+        tok2 = token_for(subject, [B + "gmail.modify"])
         mod = build("gmail", "v1", credentials=Credentials(token=tok2),
                     cache_discovery=False)
     except urllib.error.HTTPError:
@@ -634,14 +446,14 @@ def probe_send(source_token: str, sa: str, subject: str) -> None:
                f"LEFTOVER thread {sent.get('threadId')}")
 
 
-def rung5_write(source_token: str, sa: str, subjects: list[str]) -> None:
+def rung5_write(subjects: list[str]) -> None:
     print("\n=== rung 5: write round-trip (creates then deletes) ===")
     print(f"  tag: {TAG}")
     for subject in subjects:
-        probe_task(source_token, sa, subject)
-        probe_event(source_token, sa, subject)
-        probe_draft(source_token, sa, subject)
-        probe_send(source_token, sa, subject)
+        probe_task(subject)
+        probe_event(subject)
+        probe_draft(subject)
+        probe_send(subject)
 
 
 # -------------------------------------------------------------------- main ---
@@ -656,19 +468,13 @@ def main() -> None:
     print(f"clv-dwd-health  {time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     print(f"subjects: {', '.join(subjects)}")
 
-    print(f"mode: {MODE}" + ("  (SA key present)" if MODE == "key"
-                             else "  (legacy mini@ token - expires on reauth clock)"))
-    if MODE == "key":
-        source_token, sa = rung1_key()
-        rung2_local_sign(sa)
-    else:
-        source_token, sa = rung1_token()
-        rung2_signjwt(source_token, sa)
-    granted = rung3_scopes(source_token, sa, subjects[0])
-    alive = rung4_subjects(source_token, sa, subjects)
-    rung4_directory(source_token, sa, granted)
+    sa = rung1_key()
+    rung2_local_sign(sa)
+    granted = rung3_scopes(subjects[0])
+    alive = rung4_subjects(subjects)
+    rung4_directory(granted)
     if args.write:
-        rung5_write(source_token, sa, alive)
+        rung5_write(alive)
     else:
         print("\n=== rung 5: skipped (pass --write) ===")
 
