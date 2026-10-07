@@ -1,5 +1,5 @@
-#!/usr/bin/env -S uv run --quiet --with google-auth --with google-api-python-client --script
-"""Google DWD from the mini — no SA key. signJwt via mini@ Token Creator.
+#!/usr/bin/env -S uv run --quiet --with google-auth --with google-api-python-client --with requests --script
+"""Google DWD from the mini. The SA signs its own JWTs with a local key.
 
   clv-dwd as <email>                         print Google identity
   clv-dwd verify <email1> <email2>           two-subject proof
@@ -10,94 +10,98 @@
           [--due YYYY-MM-DD]                 add task to subject's @default list
   clv-dwd event --as <email> --summary <text> \\
           --start <iso> --end <iso> [--tz <tz>]  add event to subject's calendar
+
+Read as a subject (same SA key; no mini@ token involved):
+
+  clv-dwd mail --as <email> [--q <gmail query>] [--unread] [--max N]
+  clv-dwd msg --as <email> --id <message id> [--thread]
+  clv-dwd agenda --as <email> [--date YYYY-MM-DD] [--days N] \\
+          [--calendar <id>] [--q <text>] [--tz <tz>]
+  clv-dwd calendars --as <email>
+  clv-dwd tasks --as <email> [--list <id or title>] [--all]
+  clv-dwd files --as <email> [--text <words>] [--name <words>] [--query <raw q>]
+          [--drive <shared drive id>] [--max N]
+  clv-dwd file --as <email> --id <file id> [--out <path>] [--max-chars N]
+  clv-dwd sheet --as <email> --id <sheet id> [--range 'Tab!A1:D20']
+
+Drive, Docs and Sheets writes, and the rest:
+
+  clv-dwd copy --as <email> --id <file id> [--name <text>] [--parent <folder id>]
+  clv-dwd mkdir --as <email> --name <text> [--parent <folder id>]
+  clv-dwd upload --as <email> --path <file> [--name <text>] [--parent <folder id>] [--convert]
+  clv-dwd update --as <email> --id <file id> [--path <file>] [--name <text>] [--move-to <folder id>]
+  clv-dwd trash --as <email> --id <file id>
+  clv-dwd export --as <email> --id <file id> --format pdf|docx|md|... --out <path>
+  clv-dwd sheet-append --as <email> --id <sheet id> --range <tab> --row <cell> <cell> ...
+  clv-dwd sheet-write --as <email> --id <sheet id> --range 'Tab!A2' --row <cell> <cell> ...
+  clv-dwd event-update --as <email> --id <event id> [--summary|--start|--end|--location|--description]
+  clv-dwd event-delete --as <email> --id <event id>
+  clv-dwd task-done --as <email> --id <task id> [--list <list id>] [--undo]
+  clv-dwd task-delete --as <email> --id <task id> [--list <list id>]
+  clv-dwd draft --as <email> --to <email> --subject <text> --body <text>
+  clv-dwd draft-delete --as <email> --id <draft id>
+
+Gmail labels and Drive sharing:
+
+  clv-dwd labels --as <email>
+  clv-dwd label --as <email> --id <message id> [--read|--unread] [--archive] [--trash] \\
+          [--add <label> ...] [--remove <label> ...] [--thread]
+  clv-dwd perms --as <email> --id <file or folder or shared drive id>
+  clv-dwd share --as <email> --id <id> --email <email> | --domain <domain> \\
+          [--role reader|commenter|writer|fileOrganizer|organizer] [--notify]
+  clv-dwd unshare --as <email> --id <id> --email <email> | --domain <domain>
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import html
 import json
+import mimetypes
+import re
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 SA_META = Path("/Users/nascentech/.collevity/auth/_service/sa.json")
-USER_TOKEN = Path("/Users/nascentech/.collevity/auth/tokens/mini@nascentech.com.json")
+SA_KEY = Path("/Users/nascentech/.collevity/auth/_service/sa-key.json")
 
 
 def sa_email() -> str:
-    return json.loads(SA_META.read_text())["email"]
+    return json.loads(SA_KEY.read_text())["client_email"]
 
 
-def source_token() -> str:
-    d = json.loads(USER_TOKEN.read_text())
-    c = Credentials(
-        token=d.get("token"),
-        refresh_token=d.get("refresh_token"),
-        token_uri=d.get("token_uri") or "https://oauth2.googleapis.com/token",
-        client_id=d["client_id"],
-        client_secret=d["client_secret"],
-        scopes=d.get("scopes"),
-    )
-    if not c.valid:
-        c.refresh(Request())
-    return c.token
+def as_user(subject: str, scopes: list[str]):
+    """Impersonate `subject` for `scopes`.
 
-
-def as_user(subject: str, scopes: list[str]) -> Credentials:
-    now = int(time.time())
-    claim = {
-        "iss": sa_email(),
-        "sub": subject,
-        "aud": "https://oauth2.googleapis.com/token",
-        "iat": now,
-        "exp": now + 3600,
-        "scope": " ".join(scopes),
-    }
-    url = (
-        "https://iamcredentials.googleapis.com/v1/projects/-"
-        "/serviceAccounts/%s:signJwt" % sa_email()
-    )
-    body = json.dumps({"payload": json.dumps(claim)}).encode()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": "Bearer " + source_token(),
-            "Content-Type": "application/json",
-        },
-    )
+    The SA signs its own assertion with the private key, offline. There is no
+    user credential in the path, so nothing here expires on a human-session
+    reauth clock — which is what the previous mini@ + signJwt design died on.
+    """
+    if not SA_KEY.exists():
+        sys.exit(f"missing SA key: {SA_KEY}")
     try:
-        with urllib.request.urlopen(req) as resp:
-            signed = json.loads(resp.read())["signedJwt"]
-    except urllib.error.HTTPError as e:
-        sys.exit("signJwt HTTP %s: %s" % (e.code, e.read().decode(errors="replace")))
-    data = urllib.parse.urlencode(
-        {
-            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            "assertion": signed,
-        }
-    ).encode()
-    req = urllib.request.Request(
-        "https://oauth2.googleapis.com/token", data=data, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return Credentials(token=json.loads(resp.read())["access_token"])
-    except urllib.error.HTTPError as e:
+        creds = service_account.Credentials.from_service_account_file(
+            str(SA_KEY), scopes=scopes, subject=subject
+        )
+        creds.refresh(Request())
+        return creds
+    except RefreshError as e:
+        payload = next((a for a in e.args if isinstance(a, dict)), {})
         sys.exit(
-            "token HTTP %s: %s\n"
+            "token exchange failed for %s: %s\n"
             "DWD JWT scopes must be exact strings from the Admin grant "
             "(gmail.modify is not gmail.readonly)."
-            % (e.code, e.read().decode(errors="replace"))
+            % (subject, payload.get("error_description") or e)
         )
 
 
@@ -197,9 +201,636 @@ def cmd_event(as_email: str, summary: str, start: str, end: str, tz: str) -> Non
     print("link", ev.get("htmlLink"))
 
 
+# --- read commands -----------------------------------------------------------
+# Everything below reads as the subject through the same SA key. None of it
+# touches the mini@ user token, so none of it dies on the reauth clock.
+
+GMAIL = "https://www.googleapis.com/auth/gmail.modify"
+CALENDAR = "https://www.googleapis.com/auth/calendar"
+TASKS = "https://www.googleapis.com/auth/tasks"
+DRIVE = "https://www.googleapis.com/auth/drive"
+
+
+def _hdr(msg: dict, name: str) -> str:
+    for h in (msg.get("payload") or {}).get("headers", []):
+        if h.get("name", "").lower() == name.lower():
+            return h.get("value", "")
+    return ""
+
+
+def _b64(data: str) -> str:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("utf-8", "replace")
+
+
+def _body(payload: dict) -> tuple[str, list[str]]:
+    """Return (text, attachment names). Prefers text/plain, falls back to stripped HTML."""
+    plain, html_parts, files = [], [], []
+
+    def walk(part: dict) -> None:
+        if part.get("filename"):
+            files.append(part["filename"])
+        data = (part.get("body") or {}).get("data")
+        mime = part.get("mimeType", "")
+        if data and not part.get("filename"):
+            if mime == "text/plain":
+                plain.append(_b64(data))
+            elif mime == "text/html":
+                html_parts.append(_b64(data))
+        for sub in part.get("parts", []) or []:
+            walk(sub)
+
+    walk(payload or {})
+    if plain:
+        return "\n".join(plain).strip(), files
+    text = re.sub(r"(?is)<(script|style).*?</\1>", "", "\n".join(html_parts))
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", text)
+    text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    return re.sub(r"\n\s*\n\s*\n+", "\n\n", text).strip(), files
+
+
+def cmd_mail(as_email: str, q: str | None, unread: bool, limit: int) -> None:
+    creds = as_user(as_email, [GMAIL])
+    gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    query = q or "in:inbox"
+    if unread:
+        query += " is:unread"
+    res = gmail.users().messages().list(userId="me", q=query, maxResults=limit).execute()
+    ids = [m["id"] for m in res.get("messages", [])]
+    print("as", as_email)
+    print("query", query)
+    print("count", len(ids), "(more available)" if res.get("nextPageToken") else "")
+    for mid in ids:
+        m = (
+            gmail.users()
+            .messages()
+            .get(userId="me", id=mid, format="metadata", metadataHeaders=["From", "Subject", "Date"])
+            .execute()
+        )
+        flag = "UNREAD" if "UNREAD" in m.get("labelIds", []) else "read  "
+        print("---")
+        print(mid, "|", flag, "|", _hdr(m, "Date"))
+        print("from:", _hdr(m, "From"))
+        print("subject:", _hdr(m, "Subject"))
+        print("snippet:", html.unescape(m.get("snippet", "")))
+
+
+def _print_msg(m: dict) -> None:
+    text, files = _body(m.get("payload") or {})
+    print("id", m.get("id"), "| thread", m.get("threadId"))
+    for name in ("Date", "From", "To", "Cc", "Subject"):
+        if _hdr(m, name):
+            print("%s: %s" % (name.lower(), _hdr(m, name)))
+    if files:
+        print("attachments:", ", ".join(files))
+    print()
+    print(text or "(no text body)")
+
+
+def cmd_msg(as_email: str, msg_id: str, thread: bool) -> None:
+    """Read only. Does not mark the message read."""
+    creds = as_user(as_email, [GMAIL])
+    gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    print("as", as_email)
+    if thread:
+        t = gmail.users().threads().get(userId="me", id=msg_id, format="full").execute()
+        for m in t.get("messages", []):
+            print("=" * 60)
+            _print_msg(m)
+    else:
+        _print_msg(gmail.users().messages().get(userId="me", id=msg_id, format="full").execute())
+
+
+def cmd_calendars(as_email: str) -> None:
+    creds = as_user(as_email, [CALENDAR])
+    cal = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    items = cal.calendarList().list().execute().get("items", [])
+    print("as", as_email, "count", len(items))
+    for c in items:
+        print(c.get("id"), "|", c.get("summary"), "|", c.get("accessRole"), "| primary" if c.get("primary") else "")
+
+
+def cmd_agenda(as_email: str, date: str | None, days: int, calendar: str, tz: str, q: str | None) -> None:
+    creds = as_user(as_email, [CALENDAR])
+    cal = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    zone = ZoneInfo(tz)
+    day = datetime.strptime(date, "%Y-%m-%d").date() if date else datetime.now(zone).date()
+    start = datetime(day.year, day.month, day.day, tzinfo=zone)
+    end = start + timedelta(days=days)
+    kwargs = dict(
+        calendarId=calendar,
+        timeMin=start.isoformat(),
+        timeMax=end.isoformat(),
+        singleEvents=True,
+        orderBy="startTime",
+        timeZone=tz,
+        maxResults=250,
+    )
+    if q:
+        kwargs["q"] = q
+    items = cal.events().list(**kwargs).execute().get("items", [])
+    print("as", as_email)
+    print("calendar", calendar, "|", start.date(), "->", (end - timedelta(days=1)).date(), "|", tz)
+    print("count", len(items))
+    for ev in items:
+        s, e = ev.get("start", {}), ev.get("end", {})
+        when = (
+            "%s -> %s" % (s["dateTime"][:16], e.get("dateTime", "")[11:16])
+            if "dateTime" in s
+            else "%s (all day)" % s.get("date")
+        )
+        mine = next((a.get("responseStatus") for a in ev.get("attendees", []) if a.get("self")), None)
+        print("---")
+        print(when, "|", ev.get("summary", "(no title)"))
+        if ev.get("location"):
+            print("where:", ev["location"])
+        who = [a.get("email", "") for a in ev.get("attendees", []) if not a.get("self")]
+        if who:
+            print("with:", ", ".join(who[:12]), "(+%d)" % (len(who) - 12) if len(who) > 12 else "")
+        if mine:
+            print("response:", mine)
+        print("id", ev.get("id"))
+
+
+def cmd_tasks(as_email: str, tasklist: str | None, show_all: bool) -> None:
+    creds = as_user(as_email, [TASKS])
+    tasks = build("tasks", "v1", credentials=creds, cache_discovery=False)
+    lists = tasks.tasklists().list(maxResults=100).execute().get("items", [])
+    if tasklist:
+        lists = [l for l in lists if l.get("id") == tasklist or l.get("title") == tasklist]
+        if not lists:
+            sys.exit("no task list matching %r" % tasklist)
+    print("as", as_email)
+    for l in lists:
+        items = (
+            tasks.tasks()
+            .list(tasklist=l["id"], maxResults=100, showCompleted=show_all, showHidden=show_all)
+            .execute()
+            .get("items", [])
+        )
+        print("---")
+        print("list:", l.get("title"), "|", l.get("id"), "| count", len(items))
+        for t in items:
+            mark = "x" if t.get("status") == "completed" else " "
+            print("[%s] %s | due %s | id %s" % (mark, t.get("title", ""), (t.get("due") or "-")[:10], t.get("id")))
+            if t.get("notes"):
+                print("    notes:", t["notes"][:300].replace("\n", " "))
+
+
+def cmd_files(as_email: str, text: str | None, name: str | None, query: str | None, limit: int,
+              drive: str | None = None) -> None:
+    """Search Drive as the subject, shared drives included. --drive limits it to one shared drive."""
+    creds = as_user(as_email, [DRIVE])
+    drv = build("drive", "v3", credentials=creds, cache_discovery=False)
+    esc = lambda s: s.replace("\\", "\\\\").replace("'", "\\'")
+    if query:
+        q = query
+    else:
+        clauses = ["trashed = false"]
+        if text:
+            clauses.append("fullText contains '%s'" % esc(text))
+        if name:
+            clauses.append("name contains '%s'" % esc(name))
+        q = " and ".join(clauses)
+    kwargs = dict(
+        q=q,
+        pageSize=limit,
+        corpora="allDrives",
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+        fields="nextPageToken, files(id,name,mimeType,modifiedTime,lastModifyingUser(displayName),webViewLink)",
+    )
+    if drive:
+        kwargs.update(corpora="drive", driveId=drive)
+    if "fullText" not in q:  # Drive rejects orderBy alongside fullText
+        kwargs["orderBy"] = "modifiedTime desc"
+    res = drv.files().list(**kwargs).execute()
+    items = res.get("files", [])
+    print("as", as_email)
+    print("q", q)
+    print("count", len(items), "(more available)" if res.get("nextPageToken") else "")
+    for f in items:
+        print("---")
+        print(f.get("name"), "|", f.get("mimeType", "").replace("application/vnd.google-apps.", "g:"))
+        print("modified", (f.get("modifiedTime") or "")[:16], "by", (f.get("lastModifyingUser") or {}).get("displayName", "-"))
+        print("id", f.get("id"))
+        print("link", f.get("webViewLink"))
+
+
+EXPORTS = {
+    "application/vnd.google-apps.document": "text/plain",
+    "application/vnd.google-apps.spreadsheet": "text/csv",  # first sheet only
+    "application/vnd.google-apps.presentation": "text/plain",
+}
+
+
+def cmd_file(as_email: str, file_id: str, out: str | None, max_chars: int) -> None:
+    creds = as_user(as_email, [DRIVE])
+    drv = build("drive", "v3", credentials=creds, cache_discovery=False)
+    meta = (
+        drv.files()
+        .get(fileId=file_id, supportsAllDrives=True, fields="id,name,mimeType,modifiedTime,size,webViewLink")
+        .execute()
+    )
+    mime = meta.get("mimeType", "")
+    print("as", as_email)
+    print("name", meta.get("name"))
+    print("type", mime)
+    print("modified", (meta.get("modifiedTime") or "")[:16])
+    print("link", meta.get("webViewLink"))
+    if mime in EXPORTS:
+        data = drv.files().export(fileId=file_id, mimeType=EXPORTS[mime]).execute()
+        if mime.endswith("spreadsheet"):
+            print("note: CSV export is the first sheet only")
+    elif mime.startswith("application/vnd.google-apps."):
+        print("no text export for this type; open the link")
+        return
+    else:
+        data = drv.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
+    if out:
+        Path(out).write_bytes(data)
+        print("saved", out, "bytes", len(data))
+        return
+    texty = mime in EXPORTS or mime.startswith("text/") or mime in ("application/json", "application/xml")
+    if not texty:
+        print("binary content (%d bytes); pass --out <path> to save it" % len(data))
+        return
+    text = data.decode("utf-8", "replace")
+    print()
+    print(text[:max_chars])
+    if len(text) > max_chars:
+        print("\n[truncated at %d of %d chars; raise --max-chars or use --out]" % (max_chars, len(text)))
+
+
+# --- write commands ----------------------------------------------------------
+# The Drive, Docs and Sheets work that used to need workspace-mcp, on the SA key.
+
+SHEETS = "https://www.googleapis.com/auth/spreadsheets"
+GDOC = "application/vnd.google-apps.document"
+GSHEET = "application/vnd.google-apps.spreadsheet"
+UPLOAD_TYPES = {".md": "text/markdown", ".csv": "text/csv", ".txt": "text/plain", ".html": "text/html"}
+CONVERT_TO = {
+    ".md": GDOC, ".txt": GDOC, ".html": GDOC, ".docx": GDOC,
+    ".csv": GSHEET, ".xlsx": GSHEET,
+}
+EXPORT_FORMATS = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "md": "text/markdown",
+    "txt": "text/plain",
+    "html": "text/html",
+    "csv": "text/csv",
+}
+FILE_FIELDS = "id,name,mimeType,parents,webViewLink"
+
+
+def _drive(as_email: str):
+    return build("drive", "v3", credentials=as_user(as_email, [DRIVE]), cache_discovery=False)
+
+
+def _media(path: str):
+    p = Path(path)
+    if not p.is_file():
+        sys.exit("no such file: %s" % path)
+    mime = UPLOAD_TYPES.get(p.suffix.lower()) or mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+    return p, MediaFileUpload(str(p), mimetype=mime, resumable=False)
+
+
+def _print_file(as_email: str, verb: str, f: dict) -> None:
+    print("as", as_email)
+    print(verb, f.get("name"), "|", f.get("mimeType", "").replace("application/vnd.google-apps.", "g:"))
+    print("id", f.get("id"))
+    print("link", f.get("webViewLink"))
+
+
+def cmd_copy(as_email: str, file_id: str, name: str | None, parent: str | None) -> None:
+    body = {}
+    if name:
+        body["name"] = name
+    if parent:
+        body["parents"] = [parent]
+    f = _drive(as_email).files().copy(fileId=file_id, body=body, supportsAllDrives=True, fields=FILE_FIELDS).execute()
+    _print_file(as_email, "copied", f)
+
+
+def cmd_mkdir(as_email: str, name: str, parent: str | None) -> None:
+    body = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+    if parent:
+        body["parents"] = [parent]
+    f = _drive(as_email).files().create(body=body, supportsAllDrives=True, fields=FILE_FIELDS).execute()
+    _print_file(as_email, "folder", f)
+
+
+def cmd_upload(as_email: str, path: str, name: str | None, parent: str | None, convert: bool) -> None:
+    p, media = _media(path)
+    body = {"name": name or p.name}
+    if parent:
+        body["parents"] = [parent]
+    if convert:
+        target = CONVERT_TO.get(p.suffix.lower())
+        if not target:
+            sys.exit("--convert handles %s; got %s" % (", ".join(sorted(CONVERT_TO)), p.suffix))
+        body["mimeType"] = target
+        if not name:
+            body["name"] = p.stem
+    f = (
+        _drive(as_email)
+        .files()
+        .create(body=body, media_body=media, supportsAllDrives=True, fields=FILE_FIELDS)
+        .execute()
+    )
+    _print_file(as_email, "uploaded", f)
+
+
+def cmd_update(as_email: str, file_id: str, path: str | None, name: str | None, move_to: str | None) -> None:
+    """Replace a file's content in place (same id, same link), rename it, or move it.
+
+    Giving --path a .md/.docx/.html file against a Google Doc replaces the whole Doc body.
+    """
+    drv = _drive(as_email)
+    kwargs = dict(fileId=file_id, supportsAllDrives=True, fields=FILE_FIELDS)
+    if name:
+        kwargs["body"] = {"name": name}
+    if path:
+        kwargs["media_body"] = _media(path)[1]
+    if move_to:
+        old = drv.files().get(fileId=file_id, supportsAllDrives=True, fields="parents").execute()
+        kwargs["addParents"] = move_to
+        kwargs["removeParents"] = ",".join(old.get("parents", []))
+    if not (name or path or move_to):
+        sys.exit("nothing to do: pass --path, --name or --move-to")
+    _print_file(as_email, "updated", drv.files().update(**kwargs).execute())
+
+
+def cmd_trash(as_email: str, file_id: str) -> None:
+    """Move to trash (recoverable for 30 days). Never a hard delete."""
+    f = (
+        _drive(as_email)
+        .files()
+        .update(fileId=file_id, body={"trashed": True}, supportsAllDrives=True, fields=FILE_FIELDS)
+        .execute()
+    )
+    _print_file(as_email, "trashed", f)
+
+
+def cmd_export(as_email: str, file_id: str, fmt: str, out: str) -> None:
+    drv = _drive(as_email)
+    meta = drv.files().get(fileId=file_id, supportsAllDrives=True, fields="name,mimeType").execute()
+    if not meta.get("mimeType", "").startswith("application/vnd.google-apps."):
+        sys.exit("not a Google Doc/Sheet/Slides file; use `file --out` to download it as is")
+    data = drv.files().export(fileId=file_id, mimeType=EXPORT_FORMATS[fmt]).execute()
+    Path(out).write_bytes(data)
+    print("as", as_email)
+    print("exported", meta.get("name"), "as", fmt)
+    print("saved", out, "bytes", len(data))
+
+
+def _rows(values: str | None, row: list[str] | None) -> list[list]:
+    if values:
+        rows = json.loads(values)
+        if not (isinstance(rows, list) and all(isinstance(r, list) for r in rows)):
+            sys.exit('--values must be a JSON list of rows, e.g. \'[["a","b"],["c","d"]]\'')
+        return rows
+    if row:
+        return [row]
+    sys.exit("pass --row <cell> <cell> ... or --values <json>")
+
+
+def _sheets(as_email: str):
+    return build("sheets", "v4", credentials=as_user(as_email, [SHEETS]), cache_discovery=False)
+
+
+def cmd_sheet(as_email: str, sheet_id: str, rng: str | None) -> None:
+    sh = _sheets(as_email)
+    print("as", as_email)
+    if not rng:
+        meta = sh.spreadsheets().get(spreadsheetId=sheet_id, fields="properties.title,sheets.properties").execute()
+        print("spreadsheet", meta["properties"]["title"])
+        for s in meta.get("sheets", []):
+            pr = s["properties"]
+            g = pr.get("gridProperties", {})
+            print("tab", pr.get("title"), "| rows", g.get("rowCount"), "| cols", g.get("columnCount"))
+        return
+    res = sh.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
+    rows = res.get("values", [])
+    print("range", res.get("range"), "| rows", len(rows))
+    for r in rows:
+        print(json.dumps(r, ensure_ascii=False))
+
+
+def cmd_sheet_append(as_email: str, sheet_id: str, rng: str, values: str | None, row: list[str] | None) -> None:
+    res = (
+        _sheets(as_email)
+        .spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=sheet_id,
+            range=rng,
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": _rows(values, row)},
+        )
+        .execute()
+    )
+    up = res.get("updates", {})
+    print("as", as_email)
+    print("appended", up.get("updatedRows"), "row(s) at", up.get("updatedRange"))
+
+
+def cmd_sheet_write(as_email: str, sheet_id: str, rng: str, values: str | None, row: list[str] | None) -> None:
+    res = (
+        _sheets(as_email)
+        .spreadsheets()
+        .values()
+        .update(spreadsheetId=sheet_id, range=rng, valueInputOption="USER_ENTERED", body={"values": _rows(values, row)})
+        .execute()
+    )
+    print("as", as_email)
+    print("wrote", res.get("updatedCells"), "cell(s) at", res.get("updatedRange"))
+
+
+def cmd_event_update(as_email, event_id, calendar, summary, start, end, tz, location, description) -> None:
+    body = {}
+    if summary:
+        body["summary"] = summary
+    if start:
+        body["start"] = {"dateTime": start, "timeZone": tz}
+    if end:
+        body["end"] = {"dateTime": end, "timeZone": tz}
+    if location is not None:
+        body["location"] = location
+    if description is not None:
+        body["description"] = description
+    if not body:
+        sys.exit("nothing to change")
+    cal = build("calendar", "v3", credentials=as_user(as_email, [CALENDAR]), cache_discovery=False)
+    ev = cal.events().patch(calendarId=calendar, eventId=event_id, body=body).execute()
+    print("as", as_email)
+    print("event", ev.get("summary"))
+    print("when", ev["start"].get("dateTime") or ev["start"].get("date"), "->", ev["end"].get("dateTime") or ev["end"].get("date"))
+    print("id", ev.get("id"))
+
+
+def cmd_event_delete(as_email: str, event_id: str, calendar: str) -> None:
+    cal = build("calendar", "v3", credentials=as_user(as_email, [CALENDAR]), cache_discovery=False)
+    cal.events().delete(calendarId=calendar, eventId=event_id).execute()
+    print("as", as_email)
+    print("deleted event", event_id)
+
+
+def cmd_task_done(as_email: str, task_id: str, tasklist: str, undo: bool) -> None:
+    tasks = build("tasks", "v1", credentials=as_user(as_email, [TASKS]), cache_discovery=False)
+    body = {"status": "needsAction", "completed": None} if undo else {"status": "completed"}
+    t = tasks.tasks().patch(tasklist=tasklist, task=task_id, body=body).execute()
+    print("as", as_email)
+    print("task", t.get("title"), "|", t.get("status"))
+
+
+def cmd_task_delete(as_email: str, task_id: str, tasklist: str) -> None:
+    tasks = build("tasks", "v1", credentials=as_user(as_email, [TASKS]), cache_discovery=False)
+    tasks.tasks().delete(tasklist=tasklist, task=task_id).execute()
+    print("as", as_email)
+    print("deleted task", task_id)
+
+
+def cmd_draft(as_email: str, to: str, subject: str, body: str) -> None:
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["to"] = to
+    msg["from"] = as_email
+    msg["subject"] = subject
+    gmail = build("gmail", "v1", credentials=as_user(as_email, [GMAIL]), cache_discovery=False)
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    d = gmail.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
+    print("as", as_email)
+    print("draft", d.get("id"), "| message", (d.get("message") or {}).get("id"))
+
+
+def cmd_draft_delete(as_email: str, draft_id: str) -> None:
+    gmail = build("gmail", "v1", credentials=as_user(as_email, [GMAIL]), cache_discovery=False)
+    gmail.users().drafts().delete(userId="me", id=draft_id).execute()
+    print("as", as_email)
+    print("deleted draft", draft_id)
+
+
+# --- Gmail labels and Drive sharing ------------------------------------------
+
+ROLES = ["reader", "commenter", "writer", "fileOrganizer", "organizer"]
+
+
+def _gmail(as_email: str):
+    return build("gmail", "v1", credentials=as_user(as_email, [GMAIL]), cache_discovery=False)
+
+
+def cmd_labels(as_email: str) -> None:
+    items = _gmail(as_email).users().labels().list(userId="me").execute().get("labels", [])
+    print("as", as_email, "count", len(items))
+    for l in sorted(items, key=lambda l: (l.get("type") != "system", l.get("name", "").lower())):
+        print(l.get("type"), "|", l.get("name"), "|", l.get("id"))
+
+
+def _label_ids(gmail, names: list[str]) -> list[str]:
+    """Accept label names or ids. System labels (INBOX, UNREAD, STARRED…) are their own ids."""
+    if not names:
+        return []
+    known = gmail.users().labels().list(userId="me").execute().get("labels", [])
+    by_name = {l["name"].lower(): l["id"] for l in known}
+    ids = {l["id"] for l in known}
+    out = []
+    for n in names:
+        if n in ids:
+            out.append(n)
+        elif n.lower() in by_name:
+            out.append(by_name[n.lower()])
+        else:
+            sys.exit("no such label: %s (see `clv-dwd labels`)" % n)
+    return out
+
+
+def cmd_label(as_email, msg_id, add, remove, read, unread, archive, trash, thread) -> None:
+    gmail = _gmail(as_email)
+    target = gmail.users().threads() if thread else gmail.users().messages()
+    kind = "thread" if thread else "message"
+    print("as", as_email)
+    if trash:
+        target.trash(userId="me", id=msg_id).execute()
+        print("trashed", kind, msg_id)
+        return
+    add_ids = _label_ids(gmail, add or [])
+    rm_ids = _label_ids(gmail, remove or [])
+    if read:
+        rm_ids.append("UNREAD")
+    if unread:
+        add_ids.append("UNREAD")
+    if archive:
+        rm_ids.append("INBOX")
+    if not (add_ids or rm_ids):
+        sys.exit("nothing to change: pass --read, --unread, --archive, --trash, --add or --remove")
+    res = target.modify(userId="me", id=msg_id, body={"addLabelIds": add_ids, "removeLabelIds": rm_ids}).execute()
+    print(kind, msg_id, "| added", add_ids or "-", "| removed", rm_ids or "-")
+    if not thread:
+        print("labels now:", ", ".join(res.get("labelIds", [])))
+
+
+def _who(p: dict) -> str:
+    return p.get("emailAddress") or p.get("domain") or p.get("type", "")
+
+
+def cmd_perms(as_email: str, file_id: str) -> None:
+    drv = _drive(as_email)
+    meta = drv.files().get(fileId=file_id, supportsAllDrives=True, fields="name,mimeType").execute()
+    items = (
+        drv.permissions()
+        .list(fileId=file_id, supportsAllDrives=True, fields="permissions(id,type,role,emailAddress,domain,displayName)")
+        .execute()
+        .get("permissions", [])
+    )
+    print("as", as_email)
+    print("file", meta.get("name"), "| count", len(items))
+    for p in items:
+        print(p.get("role"), "|", p.get("type"), "|", _who(p), "|", p.get("displayName") or "-", "| id", p.get("id"))
+
+
+def cmd_share(as_email: str, file_id: str, email: str | None, domain: str | None, role: str, notify: bool) -> None:
+    """Share with one person/group, or a whole domain. Public 'anyone with the link' is not offered."""
+    if bool(email) == bool(domain):
+        sys.exit("pass exactly one of --email or --domain")
+    body = {"role": role}
+    if email:
+        body.update(type="user", emailAddress=email)
+    else:
+        body.update(type="domain", domain=domain)
+    kwargs = dict(fileId=file_id, body=body, supportsAllDrives=True, fields="id,type,role,emailAddress,domain")
+    if email:
+        kwargs["sendNotificationEmail"] = notify
+    p = _drive(as_email).permissions().create(**kwargs).execute()
+    print("as", as_email)
+    print("shared", file_id, "with", _who(p), "as", p.get("role"), "| id", p.get("id"))
+
+
+def cmd_unshare(as_email: str, file_id: str, email: str | None, domain: str | None) -> None:
+    if bool(email) == bool(domain):
+        sys.exit("pass exactly one of --email or --domain")
+    drv = _drive(as_email)
+    items = (
+        drv.permissions()
+        .list(fileId=file_id, supportsAllDrives=True, fields="permissions(id,type,role,emailAddress,domain)")
+        .execute()
+        .get("permissions", [])
+    )
+    want = (email or domain).lower()
+    hits = [p for p in items if (p.get("emailAddress") or p.get("domain") or "").lower() == want]
+    if not hits:
+        sys.exit("%s has no direct permission on this file (see `clv-dwd perms`)" % want)
+    print("as", as_email)
+    for p in hits:
+        drv.permissions().delete(fileId=file_id, permissionId=p["id"], supportsAllDrives=True).execute()
+        print("removed", _who(p), "(was %s)" % p.get("role"))
+
+
 def main() -> None:
-    p = argparse.ArgumentParser(prog="clv-dwd")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    parser = argparse.ArgumentParser(prog="clv-dwd")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_as = sub.add_parser("as", help="print Google identity for a subject")
     p_as.add_argument("email")
@@ -228,7 +859,152 @@ def main() -> None:
     p_e.add_argument("--end", required=True, help="YYYY-MM-DDTHH:MM:SS (local to --tz)")
     p_e.add_argument("--tz", default="America/New_York")
 
-    args = p.parse_args()
+    p_m = sub.add_parser("mail", help="list mail as a subject (read only)")
+    p_m.add_argument("--as", dest="as_email", required=True)
+    p_m.add_argument("--q", help="Gmail search query (default: in:inbox)")
+    p_m.add_argument("--unread", action="store_true")
+    p_m.add_argument("--max", dest="limit", type=int, default=20)
+
+    p_g = sub.add_parser("msg", help="read one message or thread as a subject")
+    p_g.add_argument("--as", dest="as_email", required=True)
+    p_g.add_argument("--id", required=True, help="message id (thread id with --thread)")
+    p_g.add_argument("--thread", action="store_true")
+
+    p_a = sub.add_parser("agenda", help="list calendar events as a subject")
+    p_a.add_argument("--as", dest="as_email", required=True)
+    p_a.add_argument("--date", help="YYYY-MM-DD (default: today in --tz)")
+    p_a.add_argument("--days", type=int, default=1)
+    p_a.add_argument("--calendar", default="primary")
+    p_a.add_argument("--q", help="free-text filter")
+    p_a.add_argument("--tz", default="America/New_York")
+
+    p_c = sub.add_parser("calendars", help="list a subject's calendars")
+    p_c.add_argument("--as", dest="as_email", required=True)
+
+    p_tl = sub.add_parser("tasks", help="list tasks as a subject")
+    p_tl.add_argument("--as", dest="as_email", required=True)
+    p_tl.add_argument("--list", dest="tasklist", help="task list id or title (default: all lists)")
+    p_tl.add_argument("--all", dest="show_all", action="store_true", help="include completed")
+
+    p_f = sub.add_parser("files", help="search Drive as a subject (shared drives included)")
+    p_f.add_argument("--as", dest="as_email", required=True)
+    p_f.add_argument("--text", help="words to find in file contents")
+    p_f.add_argument("--name", help="words to find in file names")
+    p_f.add_argument("--query", help="raw Drive q string (overrides --text/--name)")
+    p_f.add_argument("--max", dest="limit", type=int, default=20)
+    p_f.add_argument("--drive", help="shared drive id: search only that drive")
+
+    p_fg = sub.add_parser("file", help="read one Drive file as a subject")
+    p_fg.add_argument("--as", dest="as_email", required=True)
+    p_fg.add_argument("--id", required=True)
+    p_fg.add_argument("--out", help="save to this path instead of printing")
+    p_fg.add_argument("--max-chars", type=int, default=20000)
+
+    def w(name: str, help: str):
+        sp = sub.add_parser(name, help=help)
+        sp.add_argument("--as", dest="as_email", required=True)
+        return sp
+
+    p = w("copy", "copy a Drive file (e.g. a template) as a subject")
+    p.add_argument("--id", required=True)
+    p.add_argument("--name")
+    p.add_argument("--parent", help="destination folder id")
+
+    p = w("mkdir", "create a Drive folder as a subject")
+    p.add_argument("--name", required=True)
+    p.add_argument("--parent")
+
+    p = w("upload", "upload a local file to Drive as a subject")
+    p.add_argument("--path", required=True)
+    p.add_argument("--name")
+    p.add_argument("--parent")
+    p.add_argument("--convert", action="store_true", help="md/docx/html/txt -> Google Doc, csv/xlsx -> Sheet")
+
+    p = w("update", "replace a file's content in place, rename it, or move it")
+    p.add_argument("--id", required=True)
+    p.add_argument("--path", help="local file whose content replaces the Drive file's")
+    p.add_argument("--name")
+    p.add_argument("--move-to", help="folder id")
+
+    p = w("trash", "move a Drive file to trash (recoverable)")
+    p.add_argument("--id", required=True)
+
+    p = w("export", "export a Google Doc/Sheet/Slides file to a local file")
+    p.add_argument("--id", required=True)
+    p.add_argument("--format", dest="fmt", required=True, choices=sorted(EXPORT_FORMATS))
+    p.add_argument("--out", required=True)
+
+    p = w("sheet", "read a spreadsheet: tabs, or the values in --range")
+    p.add_argument("--id", required=True)
+    p.add_argument("--range", dest="rng")
+
+    for name, help in (("sheet-append", "append row(s) after the last row of a table"),
+                       ("sheet-write", "write row(s) starting at --range")):
+        p = w(name, help)
+        p.add_argument("--id", required=True)
+        p.add_argument("--range", dest="rng", required=True)
+        p.add_argument("--row", nargs="+", help="one row, one argument per cell")
+        p.add_argument("--values", help="JSON list of rows")
+
+    p = w("event-update", "change an existing event")
+    p.add_argument("--id", required=True)
+    p.add_argument("--calendar", default="primary")
+    p.add_argument("--summary")
+    p.add_argument("--start", help="YYYY-MM-DDTHH:MM:SS (local to --tz)")
+    p.add_argument("--end", help="YYYY-MM-DDTHH:MM:SS (local to --tz)")
+    p.add_argument("--tz", default="America/New_York")
+    p.add_argument("--location")
+    p.add_argument("--description")
+
+    p = w("event-delete", "delete an event")
+    p.add_argument("--id", required=True)
+    p.add_argument("--calendar", default="primary")
+
+    p = w("task-done", "mark a task completed (or --undo)")
+    p.add_argument("--id", required=True)
+    p.add_argument("--list", dest="tasklist", default="@default")
+    p.add_argument("--undo", action="store_true")
+
+    p = w("task-delete", "delete a task")
+    p.add_argument("--id", required=True)
+    p.add_argument("--list", dest="tasklist", default="@default")
+
+    p = w("draft", "create a Gmail draft as a subject (does not send)")
+    p.add_argument("--to", required=True)
+    p.add_argument("--subject", required=True)
+    p.add_argument("--body", required=True)
+
+    p = w("draft-delete", "delete a Gmail draft")
+    p.add_argument("--id", required=True)
+
+    w("labels", "list a subject's Gmail labels")
+
+    p = w("label", "mark read/unread, archive, trash, or add/remove labels on a message")
+    p.add_argument("--id", required=True, help="message id (thread id with --thread)")
+    p.add_argument("--read", action="store_true")
+    p.add_argument("--unread", action="store_true")
+    p.add_argument("--archive", action="store_true")
+    p.add_argument("--trash", action="store_true", help="move to trash (recoverable for 30 days)")
+    p.add_argument("--add", nargs="+", metavar="LABEL")
+    p.add_argument("--remove", nargs="+", metavar="LABEL")
+    p.add_argument("--thread", action="store_true")
+
+    p = w("perms", "list who has access to a Drive file, folder or shared drive")
+    p.add_argument("--id", required=True)
+
+    p = w("share", "give a person, group or domain access to a Drive item")
+    p.add_argument("--id", required=True)
+    p.add_argument("--email")
+    p.add_argument("--domain")
+    p.add_argument("--role", default="reader", choices=ROLES)
+    p.add_argument("--notify", action="store_true", help="send Google's share email (default: no email)")
+
+    p = w("unshare", "remove a person's, group's or domain's direct access")
+    p.add_argument("--id", required=True)
+    p.add_argument("--email")
+    p.add_argument("--domain")
+
+    args = parser.parse_args()
     if args.cmd == "as":
         cmd_as(args.email)
     elif args.cmd == "verify":
@@ -241,6 +1017,62 @@ def main() -> None:
         cmd_task(args.as_email, args.title, args.due)
     elif args.cmd == "event":
         cmd_event(args.as_email, args.summary, args.start, args.end, args.tz)
+    elif args.cmd == "mail":
+        cmd_mail(args.as_email, args.q, args.unread, args.limit)
+    elif args.cmd == "msg":
+        cmd_msg(args.as_email, args.id, args.thread)
+    elif args.cmd == "agenda":
+        cmd_agenda(args.as_email, args.date, args.days, args.calendar, args.tz, args.q)
+    elif args.cmd == "calendars":
+        cmd_calendars(args.as_email)
+    elif args.cmd == "tasks":
+        cmd_tasks(args.as_email, args.tasklist, args.show_all)
+    elif args.cmd == "files":
+        cmd_files(args.as_email, args.text, args.name, args.query, args.limit, args.drive)
+    elif args.cmd == "file":
+        cmd_file(args.as_email, args.id, args.out, args.max_chars)
+    elif args.cmd == "copy":
+        cmd_copy(args.as_email, args.id, args.name, args.parent)
+    elif args.cmd == "mkdir":
+        cmd_mkdir(args.as_email, args.name, args.parent)
+    elif args.cmd == "upload":
+        cmd_upload(args.as_email, args.path, args.name, args.parent, args.convert)
+    elif args.cmd == "update":
+        cmd_update(args.as_email, args.id, args.path, args.name, args.move_to)
+    elif args.cmd == "trash":
+        cmd_trash(args.as_email, args.id)
+    elif args.cmd == "export":
+        cmd_export(args.as_email, args.id, args.fmt, args.out)
+    elif args.cmd == "sheet":
+        cmd_sheet(args.as_email, args.id, args.rng)
+    elif args.cmd == "sheet-append":
+        cmd_sheet_append(args.as_email, args.id, args.rng, args.values, args.row)
+    elif args.cmd == "sheet-write":
+        cmd_sheet_write(args.as_email, args.id, args.rng, args.values, args.row)
+    elif args.cmd == "event-update":
+        cmd_event_update(args.as_email, args.id, args.calendar, args.summary, args.start,
+                         args.end, args.tz, args.location, args.description)
+    elif args.cmd == "event-delete":
+        cmd_event_delete(args.as_email, args.id, args.calendar)
+    elif args.cmd == "task-done":
+        cmd_task_done(args.as_email, args.id, args.tasklist, args.undo)
+    elif args.cmd == "task-delete":
+        cmd_task_delete(args.as_email, args.id, args.tasklist)
+    elif args.cmd == "draft":
+        cmd_draft(args.as_email, args.to, args.subject, args.body)
+    elif args.cmd == "draft-delete":
+        cmd_draft_delete(args.as_email, args.id)
+    elif args.cmd == "labels":
+        cmd_labels(args.as_email)
+    elif args.cmd == "label":
+        cmd_label(args.as_email, args.id, args.add, args.remove, args.read, args.unread,
+                  args.archive, args.trash, args.thread)
+    elif args.cmd == "perms":
+        cmd_perms(args.as_email, args.id)
+    elif args.cmd == "share":
+        cmd_share(args.as_email, args.id, args.email, args.domain, args.role, args.notify)
+    elif args.cmd == "unshare":
+        cmd_unshare(args.as_email, args.id, args.email, args.domain)
 
 
 if __name__ == "__main__":

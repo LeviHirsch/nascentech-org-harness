@@ -1,0 +1,45 @@
+#!/bin/zsh
+# Self-cleaning write test for a clv-dwd build. Everything it makes, it removes.
+# usage: clv-dwd-selftest-writes [path-to-clv-dwd] [subject]
+C=${1:-$HOME/.collevity/bin/clv-dwd.next}
+M=${2:-mini@nascentech.com}
+T=$(mktemp -d); fails=0
+idof(){ grep -m1 "^id " | cut -d" " -f2; }
+ok(){ if [ $1 -eq 0 ]; then echo "[ ok ] $2"; else echo "[FAIL] $2"; fails=$((fails+1)); fi; }
+echo "testing $C as $M"
+printf "# clv-dwd selftest\n\nfirst body\n" > $T/doc.md
+printf "# clv-dwd selftest\n\nSECOND body\n" > $T/doc2.md
+printf "name,n\nalpha,1\n" > $T/t.csv
+
+out=$($C mkdir --as $M --name "clv-dwd-selftest" 2>&1); rc=$?; FOLD=$(echo "$out" | idof); ok $rc "mkdir"
+out=$($C upload --as $M --path $T/doc.md --parent $FOLD --convert 2>&1); rc=$?; DOC=$(echo "$out" | idof); ok $rc "upload md -> Google Doc"
+out=$($C copy --as $M --id $DOC --name "selftest copy" --parent $FOLD 2>&1); rc=$?; CP=$(echo "$out" | idof); ok $rc "copy"
+$C update --as $M --id $CP --path $T/doc2.md --name "selftest copy renamed" >/dev/null 2>$T/err; ok $? "update content + name in place $(head -c 200 $T/err)"
+out=$($C file --as $M --id $CP 2>&1); echo "$out" | grep -q "SECOND body" && echo "$out" | grep -q "selftest copy renamed"; ok $? "  read-back shows new content and name"
+$C export --as $M --id $CP --format pdf --out $T/out.pdf >/dev/null 2>$T/err; [ "$(head -c 4 $T/out.pdf 2>/dev/null)" = "%PDF" ]; ok $? "export pdf $(head -c 200 $T/err)"
+out=$($C upload --as $M --path $T/out.pdf --name "selftest.pdf" --parent $FOLD 2>&1); rc=$?; PDF=$(echo "$out" | idof); ok $rc "upload pdf (no convert)"
+out=$($C upload --as $M --path $T/t.csv --parent $FOLD --convert 2>&1); rc=$?; SH=$(echo "$out" | idof); ok $rc "upload csv -> Sheet"
+out=$($C sheet --as $M --id $SH 2>&1); ok $? "sheet tabs"; TAB=$(echo "$out" | grep -m1 "^tab " | sed -E "s/^tab (.*) \| rows.*/\1/")
+$C sheet-append --as $M --id $SH --range "$TAB" --row beta 2 >/dev/null 2>&1; ok $? "sheet-append --row"
+$C sheet-append --as $M --id $SH --range "$TAB" --values '[["gamma",3],["delta",4]]' >/dev/null 2>&1; ok $? "sheet-append --values"
+$C sheet-write --as $M --id $SH --range "$TAB!B2" --row 99 >/dev/null 2>&1; ok $? "sheet-write"
+out=$($C sheet --as $M --id $SH --range "$TAB!A1:B6" 2>&1); echo "$out" | grep -q '"alpha", "99"' && echo "$out" | grep -q delta; ok $? "  read-back has written + appended rows"
+for f in $SH $PDF $CP $DOC $FOLD; do [ -n "$f" ] && { $C trash --as $M --id $f >/dev/null 2>&1; ok $? "trash $f"; }; done
+
+out=$($C event --as $M --summary "clv-dwd selftest" --start 2030-01-07T09:00:00 --end 2030-01-07T09:30:00 2>&1); EV=$(echo "$out" | idof)
+$C event-update --as $M --id $EV --summary "clv-dwd selftest moved" --start 2030-01-07T10:00:00 --end 2030-01-07T10:30:00 >/dev/null 2>&1; ok $? "event-update"
+$C agenda --as $M --date 2030-01-07 | grep -q "10:00 -> 10:30 | clv-dwd selftest moved"; ok $? "  agenda shows the moved event"
+$C event-delete --as $M --id $EV >/dev/null 2>&1; ok $? "event-delete"
+$C agenda --as $M --date 2030-01-07 | grep -q "selftest"; [ $? -ne 0 ]; ok $? "  event is gone"
+
+out=$($C task --as $M --title "clv-dwd selftest" 2>&1); TK=$(echo "$out" | idof)
+$C task-done --as $M --id $TK >/dev/null 2>&1; ok $? "task-done"
+$C task-done --as $M --id $TK --undo >/dev/null 2>&1; ok $? "task-done --undo"
+$C task-delete --as $M --id $TK >/dev/null 2>&1; ok $? "task-delete"
+
+out=$($C draft --as $M --to $M --subject "clv-dwd selftest" --body "not sent" 2>&1); rc=$?; DR=$(echo "$out" | grep "^draft" | cut -d" " -f2); ok $rc "draft"
+$C draft-delete --as $M --id $DR >/dev/null 2>&1; ok $? "draft-delete"
+
+command rm -rf $T
+echo; [ $fails -eq 0 ] && echo "ALL PASS" || echo "$fails FAILED"
+exit $fails

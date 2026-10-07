@@ -1,0 +1,28 @@
+#!/bin/sh
+# clv-tmux — join the shared work session.
+#
+# One base session ("main") holds the windows. Each principal gets their own
+# *view* onto it, grouped via `new-session -t`: same windows, independent
+# navigation. So Q changing window does not move your screen, but you are
+# both looking at the same shells.
+#
+# Identity comes from `clv whoami` and nowhere else — not $USER, not the key.
+# Substrate swaps stay invisible here, same rule as every other consumer.
+
+set -eu
+
+BASE="${1:-main}"
+
+WHO="$(clv whoami 2>/dev/null | awk '/^principal:/{print $2}')"
+[ -n "${WHO:-}" ] || WHO="anon"
+VIEW="${BASE}-${WHO}"
+
+# Base session holds the real windows; created detached on first use.
+tmux has-session -t "=$BASE" 2>/dev/null || tmux new-session -d -s "$BASE"
+
+# Reconnecting? Reuse your existing view rather than stacking up new ones.
+if tmux has-session -t "=$VIEW" 2>/dev/null; then
+	exec tmux attach-session -t "=$VIEW"
+fi
+
+exec tmux new-session -t "=$BASE" -s "$VIEW"
