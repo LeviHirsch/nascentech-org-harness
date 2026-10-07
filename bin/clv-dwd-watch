@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""clv-dwd-watch — is the DWD chain still alive? Cheap enough to run on a timer.
+
+Deliberately stdlib-only. The health check can afford `uv run --with` and a few
+seconds of dependency resolution; a watchdog running every half hour cannot, and
+a watchdog that fails because its own deps failed to resolve is worse than none.
+
+Since the SA-key migration nothing in the auth path expires, so this no longer
+guards against a clock. It guards against the two things that can still change
+underneath you without warning:
+
+  1 key      the private key still exists and still signs
+  2 grant    the Admin DWD grant still honours an impersonation
+
+RS256 signing goes through the openssl binary rather than google-auth, keeping
+this stdlib-only: a watchdog that fails because its own dependencies failed to
+resolve is worse than no watchdog.
+
+  clv-dwd-watch            one check, append to log, exit non-zero on failure
+  clv-dwd-watch --status   read the log back: current state, uptime since mint
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HOME = pathlib.Path("/Users/nascentech")
+SA_KEY = HOME / ".collevity/auth/_service/sa-key.json"
+LOG = HOME / ".collevity/auth/dwd-watch.log"
+STATE = HOME / ".collevity/auth/dwd-watch.state"
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def post(url: str, data: bytes, headers: dict | None = None) -> dict:
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers or {})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def b64u(raw: bytes) -> bytes:
+    import base64
+    return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+
+def sign_rs256(pem: str, signing_input: bytes) -> bytes:
+    """Sign with openssl. The key is already on disk at 0600; the temp copy is
+    the same exposure class and is unlinked immediately."""
+    import os, subprocess, tempfile
+    fd, path = tempfile.mkstemp()
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(pem)
+        r = subprocess.run(["openssl", "dgst", "-sha256", "-sign", path],
+                           input=signing_input, capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.decode(errors="replace")[:120])
+        return r.stdout
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def check() -> tuple[str, str]:
+    """Return (status, detail). status is OK or FAIL."""
+    # --- link 1: key present and usable -------------------------------------
+    try:
+        k = json.loads(SA_KEY.read_text())
+        pem, iss = k["private_key"], k["client_email"]
+    except Exception as e:
+        return "FAIL", f"key-file {type(e).__name__}"
+
+    now_s = int(time.time())
+    header = b64u(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    payload = b64u(json.dumps({
+        "iss": iss,
+        "sub": "levi@nascentech.com",
+        "aud": "https://oauth2.googleapis.com/token",
+        "iat": now_s,
+        "exp": now_s + 600,
+        "scope": "https://www.googleapis.com/auth/drive",
+    }).encode())
+    signing_input = header + b"." + payload
+    try:
+        assertion = signing_input + b"." + b64u(sign_rs256(pem, signing_input))
+    except Exception as e:
+        return "FAIL", f"sign {e}"
+
+    # --- link 2: the Admin grant still honours it ---------------------------
+    body = urllib.parse.urlencode({
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": assertion.decode(),
+    }).encode()
+    try:
+        post("https://oauth2.googleapis.com/token", body)["access_token"]
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode(errors="replace")
+        try:
+            err = json.loads(raw).get("error", "")
+        except Exception:
+            err = raw[:60]
+        return "FAIL", f"exchange {err}"
+    except Exception as e:
+        return "FAIL", f"exchange {type(e).__name__}"
+
+    return "OK", "key+grant"
+
+
+def prev_status() -> str:
+    try:
+        return STATE.read_text().split()[0]
+    except Exception:
+        return "UNKNOWN"
+
+
+def run_check() -> int:
+    status, detail = check()
+    was = prev_status()
+    line = f"{now()} {status} {detail}"
+    if status != was and was != "UNKNOWN":
+        line += f"  <<< TRANSITION {was}->{status}"
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a") as f:
+            f.write(line + "\n")
+        STATE.write_text(f"{status} {now()} {detail}\n")
+    except Exception as e:
+        print(f"warn: could not write log/state: {e}", file=sys.stderr)
+    print(line)
+    return 0 if status == "OK" else 1
+
+
+def show_status() -> int:
+    mint = None
+    try:
+        mint = dt.datetime.fromtimestamp(SA_KEY.stat().st_mtime, dt.timezone.utc)
+    except Exception:
+        pass
+
+    print("key installed:", mint.strftime("%Y-%m-%dT%H:%M:%SZ") if mint else "?")
+    if mint:
+        age = dt.datetime.now(dt.timezone.utc) - mint
+        print(f"key age      : {age.total_seconds()/3600:.1f}h (no expiry)")
+
+    try:
+        cur = STATE.read_text().strip()
+    except Exception:
+        cur = "no state file - watch has never run"
+    print("last check   :", cur)
+
+    # The point of the log: the gap between a mint and the first FAIL after it
+    # IS the reauth window. Measure it rather than guessing at Google's default.
+    try:
+        lines = [l.strip() for l in LOG.read_text().splitlines() if l.strip()]
+    except Exception:
+        lines = []
+    if not lines:
+        print("history      : empty")
+        return 0
+
+    print(f"history      : {len(lines)} checks, {lines[0].split()[0]} -> {lines[-1].split()[0]}")
+    trans = [l for l in lines if "TRANSITION" in l]
+    if trans:
+        print("transitions  :")
+        for t in trans[-10:]:
+            print("   ", t)
+    else:
+        print("transitions  : none recorded (no observed break yet)")
+
+    # No reauth clock any more, so a FAIL here means the key or the grant
+    # changed - something a person did, not something that expired.
+    return 0
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(prog="clv-dwd-watch")
+    ap.add_argument("--status", action="store_true", help="read the log back")
+    a = ap.parse_args()
+    sys.exit(show_status() if a.status else run_check())

@@ -1,0 +1,31 @@
+#!/bin/zsh
+# Self-cleaning test for the label + sharing commands of a clv-dwd build.
+# usage: clv-dwd-selftest-labels-sharing [path-to-clv-dwd] [subject] [share-with]
+C=${1:-$HOME/.collevity/bin/clv-dwd.next}
+M=${2:-mini@nascentech.com}
+W=${3:-levi@nascentech.com}
+T=$(mktemp -d); fails=0
+idof(){ grep -m1 "^id " | cut -d" " -f2; }
+ok(){ if [ $1 -eq 0 ]; then echo "[ ok ] $2"; else echo "[FAIL] $2"; fails=$((fails+1)); fi; }
+echo "testing $C as $M (shares a scratch file with $W, no email sent)"
+
+$C labels --as $M | grep -q "system | INBOX"; ok $? "labels"
+out=$($C send --as $M --to $M --subject "clv-dwd label selftest" --body "delete me" 2>&1); MID=$(echo "$out" | idof); [ -n "$MID" ]; ok $? "send self-mail to label"
+$C label --as $M --id $MID --read >/dev/null 2>$T/err; ok $? "label --read $(head -c 160 $T/err)"
+$C label --as $M --id $MID --add STARRED --archive 2>/dev/null | grep "^labels now" | grep STARRED | grep -qv INBOX; ok $? "label --add STARRED --archive"
+$C label --as $M --id $MID --unread --remove STARRED 2>/dev/null | grep "^labels now" | grep UNREAD | grep -qv STARRED; ok $? "label --unread --remove STARRED"
+$C label --as $M --id $MID --trash >/dev/null 2>&1; ok $? "label --trash"
+$C mail --as $M --q "in:inbox subject:\"clv-dwd label selftest\"" | grep -q "^count 0"; ok $? "  test mail no longer in inbox"
+
+printf "share selftest\n" > $T/s.txt
+out=$($C upload --as $M --path $T/s.txt --name "clv-dwd-share-selftest.txt" 2>&1); FID=$(echo "$out" | idof); [ -n "$FID" ]; ok $? "upload scratch file"
+$C share --as $M --id $FID --email $W --role commenter >/dev/null 2>$T/err; ok $? "share --email --role commenter $(head -c 160 $T/err)"
+$C perms --as $M --id $FID | grep -q "^commenter | user | $W"; ok $? "  perms lists $W as commenter"
+$C file --as $W --id $FID 2>/dev/null | grep -q "share selftest"; ok $? "  $W can now read it"
+$C unshare --as $M --id $FID --email $W >/dev/null 2>&1; ok $? "unshare"
+$C perms --as $M --id $FID | grep -q "$W"; [ $? -ne 0 ]; ok $? "  $W no longer listed"
+$C trash --as $M --id $FID >/dev/null 2>&1; ok $? "trash scratch file"
+
+command rm -rf $T
+echo; [ $fails -eq 0 ] && echo "ALL PASS" || echo "$fails FAILED"
+exit $fails
