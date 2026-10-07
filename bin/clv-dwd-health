@@ -3,13 +3,15 @@
 
 The chain, and what breaks it:
 
-  1 token     mini@ refresh token alive          -> invalid_grant (consent screen
-                                                    fell out of "In production")
-  2 signJwt   mini@ has Token Creator on the SA  -> 403 PERMISSION_DENIED
-    + IAM Credentials API enabled                -> 403 SERVICE_DISABLED
+  1 key       SA key file present, well-formed   -> clv-dwd exits "missing SA key"
+  2 sign      the key signs a JWT offline        -> bad or truncated private key
   3 scopes    per-scope DWD grant in Admin       -> 401 unauthorized_client
   4 subjects  subject resolves, API answers      -> invalid_grant / API 403
   5 write     create/delete round-trip           -> API 403 on insert
+
+If the key file is missing, rungs 1-2 fall back to the legacy shape (mini@
+refresh token -> signJwt). clv-dwd no longer has that path, so the run is
+marked failed up front and the legacy rungs are diagnostic only.
 
 Rungs 1-4 are read-only. Rung 5 (--write) creates real artifacts and deletes
 them again; mail is trashed rather than purged, because purging needs the full
@@ -95,14 +97,21 @@ SUBSUMED = {
 }
 
 # What each clv-dwd subcommand actually asks for. A grant gap only matters if it
-# breaks one of these.
+# breaks one of these. Keep in step with clv-dwd: a command missing here is a
+# command this check says nothing about.
+_GMAIL, _DRIVE, _CAL = [B + "gmail.modify"], [B + "drive"], [B + "calendar"]
+_TASKS, _SHEETS = [B + "tasks"], [B + "spreadsheets"]
 CONSUMERS = {
-    "clv-dwd as": [B + "gmail.modify", B + "drive"],
-    "clv-dwd verify": [B + "calendar", B + "drive", B + "tasks"],
-    "clv-dwd users": [B + "admin.directory.user.readonly"],
-    "clv-dwd send": [B + "gmail.send"],
-    "clv-dwd task": [B + "tasks"],
-    "clv-dwd event": [B + "calendar"],
+    "as": [B + "gmail.modify", B + "drive"],
+    "verify": [B + "gmail.modify", B + "drive"],
+    "users": [B + "admin.directory.user.readonly"],
+    "send": [B + "gmail.send"],
+    **{c: _GMAIL for c in ("mail", "msg", "draft", "draft-delete", "labels", "label")},
+    **{c: _CAL for c in ("event", "agenda", "calendars", "event-update", "event-delete")},
+    **{c: _TASKS for c in ("task", "tasks", "task-done", "task-delete")},
+    **{c: _DRIVE for c in ("files", "file", "copy", "mkdir", "upload", "update", "trash",
+                           "export", "perms", "share", "unshare")},
+    **{c: _SHEETS for c in ("sheet", "sheet-append", "sheet-write")},
 }
 
 OK = "PASS"
@@ -176,9 +185,9 @@ def explain_refresh_failure(data: dict) -> None:
     print(f"\n  error_subtype: {subtype or '(none)'}  |  {desc}")
     print("\n  " + REFRESH_HINTS.get(subtype, TESTING_HINT))
     print(
-        "\n  NOTE: the SA is keyless (sa.json auth=signJwt, no private key), so\n"
-        "  every rung above this one depends on this token. Nothing downstream\n"
-        "  can be tested until it is re-minted."
+        "\n  NOTE: this is the legacy path, taken only because the SA key file is\n"
+        "  missing. Re-minting this token lets the rest of this check run, but\n"
+        "  clv-dwd does not use it: clv-dwd needs the key."
     )
 
 
@@ -415,12 +424,14 @@ def rung3_scopes(source_token: str, sa: str, probe_subject: str) -> dict[str, bo
         print(f"    {narrow.rsplit('/', 1)[1]:<26} {state}")
 
     print("\n  consumer readiness:")
+    broken = 0
     for name, needs in CONSUMERS.items():
         missing = [n.rsplit("/", 1)[1] for n in needs if not granted.get(n)]
         if missing:
-            record(f"3 consumer {name}", NO, "missing " + ", ".join(missing))
-        else:
-            record(f"3 consumer {name}", OK, "all scopes granted")
+            broken += 1
+            record(f"3 consumer clv-dwd {name}", NO, "missing " + ", ".join(missing))
+    if not broken:
+        record("3 consumers", OK, f"all {len(CONSUMERS)} clv-dwd commands have their scopes")
     return granted
 
 
@@ -662,6 +673,9 @@ def main() -> None:
         source_token, sa = rung1_key()
         rung2_local_sign(sa)
     else:
+        # clv-dwd has no token path any more, so a missing key means it is down
+        # whatever the rungs below say about the legacy chain.
+        record("0 SA key present", NO, f"{SA_KEY} missing - clv-dwd cannot run without it")
         source_token, sa = rung1_token()
         rung2_signjwt(source_token, sa)
     granted = rung3_scopes(source_token, sa, subjects[0])
