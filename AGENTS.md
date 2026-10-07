@@ -51,8 +51,10 @@ defect, and this is where it would become org-scale infrastructure.
 ## Layout
 
 ```
-bin/        clv, clv-login, clv-dwd, clv-dwd-verify, clv-stamp — source of
-            truth, deployed to ~/.collevity/bin (see bin/README.md)
+bin/        clv, clv-login, clv-stamp, clv-tmux, clv-dwd, clv-dwd-verify,
+            clv-dwd-health, clv-dwd-watch, clv-dwd-selftest-writes,
+            clv-dwd-selftest-labels-sharing — source of truth, deployed to
+            ~/.collevity/bin (see bin/README.md)
 deploy-mini push bin/ to the mini. Not a clv tool; never deployed itself
 AGENTS.md   this file (CLAUDE.md is a symlink to it)
 .tasks/     dev task board — lives on the integration branch only
@@ -83,6 +85,10 @@ with an explicit decision, not by drifting.
 - Keep the auth planes distinct. `clv whoami` (principal) · `clv-dwd`
   (Workspace subject) · `workspace-mcp` OAuth (`mini@` only) · the model API
   key (the model account). An agent's API call is **not** acting as the user.
+- `clv-dwd` signs with a service-account key that lives only on the mini
+  (`~/.collevity/auth/_service/sa-key.json`) and never in this repo. That key
+  can act as any Workspace user, and `clv-dwd` does not yet check the caller
+  against `clv whoami` — the refusal above is decided but not enforced (T6).
 
 **Nodes**
 - A node is a directory. Its address is its **full path** — bare names are not
