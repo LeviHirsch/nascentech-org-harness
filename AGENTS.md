@@ -1,9 +1,8 @@
-# collevity-org-harness
+# nascentech-org-harness
 
 > **Whose this is (Levi, 2026-10-03).** This repo is NascenTech's own server
-> harness. It is to be renamed `nascentech-org-harness` (T154). It is where to
-> "test by doing": "I don't want to be in a situation where we can't just do
-> what needs to be done to make the server work."
+> harness. It is where to "test by doing": "I don't want to be in a situation
+> where we can't just do what needs to be done to make the server work."
 >
 > The general tool, `clv` and the `.collevity` package, is built separately in
 > the `collevity` repo (`00_COLLEVITY/02_CONTENT/collevity`): "the dev of the
